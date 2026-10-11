@@ -189,7 +189,10 @@ impl RiskEngine {
         // We MUST always allow closing trades to proceed, regardless of size or cooldown.
         if trade.side == crate::models::TradeSide::BUY {
             // === 1. Anti-spoofing: minimum $1 notional ===
-            if trade_value < Decimal::from(1) {
+            if trade_value < Decimal::from(1)
+                && !(self.config.is_sim
+                    && self.config.sizing_mode == crate::models::SizingMode::TargetScalar)
+            {
                 return Err("Trade value is too small (spoofing protection)".to_string());
             }
 
@@ -231,7 +234,10 @@ impl RiskEngine {
         }
 
         // === 4. Rapid-flip guard (Gap 12): no re-entry within 60 s ===
-        if trade.side == TradeSide::BUY {
+        if trade.side == TradeSide::BUY
+            && !(self.config.is_sim
+                && self.config.sizing_mode == crate::models::SizingMode::TargetScalar)
+        {
             if let Some(&last) = self.last_buy_at.get(&trade.token_id) {
                 let age_secs = last.elapsed().as_secs();
                 if age_secs < 60 {

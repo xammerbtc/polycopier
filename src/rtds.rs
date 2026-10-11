@@ -68,10 +68,20 @@ pub fn parse_activity(v: &serde_json::Value, targets: &[String]) -> Option<Trade
 pub async fn start(config: &Config, tx: mpsc::Sender<TradeEvent>) -> anyhow::Result<()> {
     let (raw_tx, mut raw_rx) = mpsc::channel::<TradeEvent>(1000);
     crate::listener::start_ws_listener(config, raw_tx.clone()).await?;
+    let paper_start = if config.is_sim {
+        std::env::var("PAPER_EXPERIMENT_START_TIMESTAMP")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+    } else {
+        None
+    };
     tokio::spawn(async move {
         let mut seen = HashSet::new();
         let mut order = VecDeque::new();
         while let Some(event) = raw_rx.recv().await {
+            if paper_start.is_some_and(|start| event.timestamp < start) {
+                continue;
+            }
             let age = chrono::Utc::now().timestamp() - event.timestamp;
             if !(0..=300).contains(&age) {
                 continue;

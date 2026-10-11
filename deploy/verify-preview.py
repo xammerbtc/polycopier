@@ -30,8 +30,8 @@ assert state['mode'] == 'simulation'
 assert json.loads(request('/api/env')[1])['private_key'] == ''
 assert request('/api/env', {}, method='POST')[0] == 405
 cfg = json.loads(request('/api/config')[1])
-assert float(cfg['execution']['max_trade_size_usd']) == 8
-assert float(cfg['risk']['max_daily_volume_usd']) == 80
+assert float(cfg['execution']['max_trade_size_usd']) > 0
+assert float(cfg['risk']['max_daily_volume_usd']) >= 0
 assert request('/api/control', {'action':'pause'})[0] == 200
 assert json.loads(request('/api/state')[1])['paused']
 invalid = copy.deepcopy(cfg)

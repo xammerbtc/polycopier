@@ -443,6 +443,25 @@ pub fn start_strategy_engine_with_fees(
                 }
             }
             config.hot_reload();
+            // Proportional paper mode copies each fill, including additions and
+            // partial exits. Finish the preceding fill before sizing this token.
+            let proportional_paper =
+                config.is_sim && config.sizing_mode == SizingMode::TargetScalar;
+            if proportional_paper {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while state
+                    .read()
+                    .await
+                    .in_flight_tokens
+                    .contains(&event.token_id)
+                {
+                    if Instant::now() >= deadline {
+                        state.write().await.started = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
             risk_engine.update_config(config.clone());
             reconcile_risk(&mut risk_engine, &state, config.is_sim).await;
             event_count += 1;
@@ -493,7 +512,10 @@ pub fn start_strategy_engine_with_fees(
                 "{}_{}_{:?}",
                 event.taker_address, event.token_id, event.side
             );
-            if eval.validated && debounce.insert_or_accumulate(cache_key, event.clone()) {
+            if eval.validated
+                && !proportional_paper
+                && debounce.insert_or_accumulate(cache_key, event.clone())
+            {
                 continue; // accumulated — skip this event
             }
 
@@ -635,7 +657,12 @@ pub fn start_strategy_engine_with_fees(
                 let skip_reason: Option<String> = match event.side {
                     // ---- BUY -----------------------------------------------
                     TradeSide::BUY => {
-                        if already_in_token {
+                        if already_in_token
+                            && !(proportional_paper
+                                && ledger_entry.as_ref().is_some_and(|entry| {
+                                    entry.source_wallet == event.taker_address
+                                }))
+                        {
                             let from = ledger_entry
                                 .as_ref()
                                 .map(|e| &e.source_wallet[..e.source_wallet.len().min(10)])
@@ -645,7 +672,7 @@ pub fn start_strategy_engine_with_fees(
                                 &event.token_id[..event.token_id.len().min(12)],
                                 from
                             ))
-                        } else if !live_target_holds && live_we_hold {
+                        } else if !proportional_paper && !live_target_holds && live_we_hold {
                             Some(
                                 "BUY skipped: we hold long but target has no position \
                                  (likely closing their short)"
@@ -806,8 +833,17 @@ pub fn start_strategy_engine_with_fees(
                     } else {
                         our_held_size
                     };
-                    let truncated_size =
-                        (our_held_size * config.sell_fee_buffer).trunc_with_scale(2);
+                    let scalar = config
+                        .target_scalars
+                        .get(&event.taker_address)
+                        .copied()
+                        .unwrap_or(Decimal::ONE);
+                    let desired = if proportional_paper {
+                        (event.size * scalar).min(our_held_size)
+                    } else {
+                        our_held_size * config.sell_fee_buffer
+                    };
+                    let truncated_size = desired.trunc_with_scale(2);
                     if truncated_size <= rust_decimal::Decimal::ZERO {
                         let msg = format!("Dust fractional balance {:.4} truncates to 0.00 — skipping limit order logic.", our_held_size);
                         tracing::warn!("{}", msg);
@@ -855,12 +891,20 @@ pub fn start_strategy_engine_with_fees(
                     );
                     // Budget exactly reflects the sizing engine's mathematical intent.
                     // (TargetUSD mirrors natively, Scalars scale natively, Fixed/SelfPct override natively)
-                    let raw_size = budget_usd / limit_price;
+                    let raw_size = if proportional_paper {
+                        // Copy shares exactly; slippage and fees change cash spent,
+                        // never silently shrink the requested fraction of the fill.
+                        (event.size * wallet_scalar).min(config.max_trade_size_usd / limit_price)
+                    } else {
+                        budget_usd / limit_price
+                    };
                     let buy_size =
                         raw_size.round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero);
 
                     // CLOB hard minimum: 5 shares. Orders below this always 400.
-                    if buy_size < MIN_ORDER_SHARES {
+                    if buy_size <= Decimal::ZERO
+                        || (!proportional_paper && buy_size < MIN_ORDER_SHARES)
+                    {
                         let msg = format!(
                             "BUY skipped: {:.2} shares < CLOB minimum of 5 shares (budget=${:.2})",
                             buy_size, budget_usd
@@ -1052,23 +1096,45 @@ pub fn start_strategy_engine_with_fees(
                                     } else {
                                         // The reservation includes the BUY fee; carry that full
                                         // basis through later partial exits and redemption.
-                                        let average_entry_price = cost_to_deduct / order_size;
+                                        let previous =
+                                            guard.positions.get(&token_id_clone).cloned();
+                                        let total_size = order_size
+                                            + previous
+                                                .as_ref()
+                                                .map(|p| p.size)
+                                                .unwrap_or(Decimal::ZERO);
+                                        let total_basis = cost_to_deduct
+                                            + previous
+                                                .as_ref()
+                                                .map(|p| p.size * p.average_entry_price)
+                                                .unwrap_or(Decimal::ZERO);
+                                        let average_entry_price = total_basis / total_size;
                                         guard.positions.insert(
                                             token_id_clone.clone(),
                                             crate::models::Position {
                                                 token_id: token_id_clone.clone(),
-                                                size: order_size,
+                                                size: total_size,
                                                 average_entry_price,
                                             },
                                         );
-                                        guard.paper_cycle_pnl.remove(&token_id_clone);
-                                        ledger.record_copy(
-                                            token_id_clone.clone(),
-                                            source_wallet_clone.clone(),
-                                            order_size,
-                                            average_entry_price,
-                                        );
-                                        ledger.update_fill(&token_id_clone, order_size);
+                                        if previous.is_none() {
+                                            guard.paper_cycle_pnl.remove(&token_id_clone);
+                                        }
+                                        if previous.is_some() {
+                                            ledger.update_paper_position(
+                                                &token_id_clone,
+                                                total_size,
+                                                average_entry_price,
+                                            );
+                                        } else {
+                                            ledger.record_copy(
+                                                token_id_clone.clone(),
+                                                source_wallet_clone.clone(),
+                                                order_size,
+                                                average_entry_price,
+                                            );
+                                        }
+                                        ledger.update_fill(&token_id_clone, total_size);
                                     }
                                     guard.pending_orders.remove(&token_id_clone);
                                     guard.unrealized_pnl = guard

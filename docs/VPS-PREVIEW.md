@@ -1,8 +1,41 @@
 # Isolated VPS deployment
 
-This deployment runs **DRY-RUN / SIMULATION**. The $200 balance and all
+This deployment runs **DRY-RUN / SIMULATION**. The opening balance and all
 positions/PnL displayed by this deployment are paper values. No CLOB
 authentication, signed orders, cancellations, or on-chain transactions occur.
+
+## Fresh proportional paper experiment
+
+The requested profile starts with **$1000**, zero positions, realized PnL and
+daily volume. The favourite wallet uses `:0.5` with `sizing.mode=target_scalar`.
+In this paper mode every BUY and SELL copies half the target's share count
+(truncated to two decimals), including repeated BUYs and partial SELLs. SELLs
+cannot exceed owned inventory; BUYs that cannot be funded including fees are
+skipped rather than silently changing the fraction. Tiny paper fills are
+included even below the live CLOB minimum, so this experiment does not establish
+live execution eligibility for those fills.
+
+Daily and consecutive-loss limits are disabled (both zero), the per-trade cap is
+set above the available bank, closing-time filtering and historical catch-up
+are disabled. The 1.5% price limit and six-second signal freshness remain active;
+unavailable fee schedules still cause a visible skip.
+
+After a successful build, an explicitly authorized reset is performed with:
+
+```bash
+flock -n /opt/arbigab/operator_control/locks/production.lock python3 deploy/start-paper-experiment.py
+```
+
+This backs up the old stopped paper state, unit, config and binary beneath
+`deploy-backups/*-experiment-reset`, updates only `polycopier-preview`, and sets
+`PAPER_EXPERIMENT_START_TIMESTAMP` to exclude trades predating the experiment.
+`paper-experiment.json` records the opening values, start time and backup path.
+Re-running this command resets the experiment again; ordinary restarts preserve it.
+
+A separate fresh real-source paper qualification observed matching dispatch and
+acceptance keys for a WebSocket target fill: dispatch upper bound **1291 ms**,
+paper acceptance upper bound **1443 ms**. This is a paper observation; no live
+order was sent.
 
 ## Installed layout
 

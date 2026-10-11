@@ -212,6 +212,21 @@ impl CopyLedger {
         );
     }
 
+    /// Update the aggregate owned paper inventory after an additional BUY.
+    pub fn update_paper_position(&mut self, token_id: &str, size: Decimal, entry_price: Decimal) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|e| !e.closed && e.token_id == token_id)
+        {
+            entry.size = size;
+            entry.filled_size = Some(size);
+            entry.entry_price = entry_price;
+            self.save();
+        }
+    }
+
     /// Update the filled size for the most recent active entry for `token_id`. (Gap 4)
     ///
     /// Called by the position-sync task when it observes a position size that
