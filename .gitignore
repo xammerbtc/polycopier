@@ -60,3 +60,10 @@ src/bin/order_test.rs
 release-final-20261011.tar
 
 durable-journal-20261011.tar
+
+fills-core-20261011.tar
+
+fills-rpc-20261011.tar
+
+fills-proof-20261011.tar
+fills-wiring-20261011.tar

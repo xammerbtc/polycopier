@@ -34,11 +34,9 @@ type State = Arc<RwLock<BotState>>;
 //    scanner's SkippedOwned check has accurate data from the first scan.
 //    Without this guarantee the scanner re-enters positions on every restart.
 // ---------------------------------------------------------------------------
-pub async fn seed_own_positions(funder: &str, state: State) {
+pub async fn seed_own_positions(funder: &str, state: State) -> anyhow::Result<()> {
     let client = DataClient::default();
-    let Ok(addr) = Address::from_str(funder) else {
-        return;
-    };
+    let addr = Address::from_str(funder)?;
     match crate::utils::fetch_all_positions(&client, addr).await {
         Ok(positions) => {
             let mut guard = state.write().await;
@@ -61,8 +59,9 @@ pub async fn seed_own_positions(funder: &str, state: State) {
                 guard.positions.len()
             );
         }
-        Err(e) => tracing::warn!("Could not seed own positions on startup: {}", e),
+        Err(e) => return Err(e),
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -138,10 +137,7 @@ pub fn start_position_sync(
                         let mut guard = state.write().await;
                         guard.positions.clear();
                         for p in &positions {
-                            if p.redeemable
-                                || p.cur_price == Decimal::ZERO
-                                || p.size <= Decimal::ZERO
-                            {
+                            if p.size <= Decimal::ZERO {
                                 continue;
                             } else {
                                 guard.positions.insert(
@@ -158,7 +154,10 @@ pub fn start_position_sync(
 
                         // Gap 4: update ledger fill sizes for partial fills.
                         let mut ledger = copy_ledger.lock().await;
-                        for p in &positions {
+                        for p in positions
+                            .iter()
+                            .filter(|_| !crate::execution_journal::active())
+                        {
                             if p.redeemable || p.cur_price == Decimal::ZERO {
                                 continue;
                             }

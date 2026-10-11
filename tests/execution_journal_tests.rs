@@ -36,6 +36,7 @@ async fn exact_order_ownership_and_uncertain_startup_protect_shared_wallet() {
     assert!(!journal::owned_ids().unwrap().contains("donor-order"));
     let config = common::test_config();
     let mut initial = BotState::new(false, None);
+    initial.live_fills_ready = true;
     initial.total_balance = dec!(100);
     for token in ["99999", "33333"] {
         initial.positions.insert(
@@ -54,11 +55,16 @@ async fn exact_order_ownership_and_uncertain_startup_protect_shared_wallet() {
         .lock()
         .await
         .record_copy("33333".into(), "0xabc".into(), dec!(20), dec!(0.5));
+    ledger.lock().await.update_fill("33333", dec!(10));
+    let sizes = Arc::new(Mutex::new(Vec::new()));
+    let observed_sizes = sizes.clone();
     let calls = Arc::new(AtomicUsize::new(0));
     let observed = calls.clone();
-    let submitter: polycopier::clients::OrderSubmitter = Arc::new(move |_| {
+    let submitter: polycopier::clients::OrderSubmitter = Arc::new(move |order| {
         let observed = observed.clone();
+        let observed_sizes = observed_sizes.clone();
         Box::pin(async move {
+            observed_sizes.lock().await.push(order.size);
             observed.fetch_add(1, Ordering::Relaxed);
             Ok(())
         })
@@ -106,6 +112,11 @@ async fn exact_order_ownership_and_uncertain_startup_protect_shared_wallet() {
     );
     drop(tx);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        *sizes.lock().await,
+        vec![dec!(10)],
+        "shared wallet balance is not copier-owned inventory"
+    );
     assert!(
         ledger.lock().await.has_any_active("33333"),
         "order acceptance cannot close an unfilled live position"

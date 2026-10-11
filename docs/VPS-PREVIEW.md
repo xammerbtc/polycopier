@@ -185,6 +185,21 @@ restarts `polycopier-preview`; retain current ledgers and snapshots. Stop only
 the new service if verification fails. Do not restart the existing trading bot.
 
 Live trading has not been enabled or certified by this preview deployment.
+Live startup completes authoritative wallet and open-order reads before starting
+the strategy. Failed reads stop startup rather than imply an empty wallet.
+Resolved holdings remain visible for redemption. Live SELL size is bounded by
+confirmed copier fills; wallet refresh cannot enlarge that inventory using
+another bot's purchases.
+
+The `live_fills` decoder reads exact shares, collateral and fees from finalized
+CTF Exchange V2 `OrderFilled` events for journal-owned order IDs. Regression
+tests include a real public target-wallet receipt, duplicate events, partial
+fills, foreign orders, finality and canonical-header checks. The read-only
+`target/release/receipt_preflight` checks the public fixture against Polygon.
+Set `POLYGON_RPC_URL` for a different Polygon provider if needed. No credentials
+are loaded by that preflight. This does not prove a copier order was executed.
+Continuous CLOB receipt collection and durable risk-outcome replay still need
+wiring; live strategy rejects execution while `live_fills_ready` is false.
 Live SELL acceptance keeps the ledger open and does not book realized profit.
 Confirmed fill and fee reconciliation remains required before enabling live
 trading; wallet position refresh alone cannot establish execution prices or

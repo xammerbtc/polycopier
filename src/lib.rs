@@ -8,6 +8,7 @@ pub mod copy_ledger;
 pub mod execution_journal;
 pub mod latency;
 pub mod listener;
+pub mod live_fills;
 pub mod live_redemption;
 pub mod log_capture;
 pub mod models;

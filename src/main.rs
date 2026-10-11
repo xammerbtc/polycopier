@@ -7,6 +7,7 @@ pub mod copy_ledger;
 pub mod execution_journal;
 pub mod latency;
 pub mod listener;
+pub mod live_fills;
 pub mod live_redemption;
 pub mod log_capture;
 pub mod models;
@@ -263,7 +264,6 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(100);
-    rtds::start(&config, event_tx.clone()).await?;
 
     // ── Copy ledger ───────────────────────────────────────────────────────────
     // Load the persisted copy ledger.  This records which positions we entered
@@ -275,6 +275,14 @@ async fn main() -> anyhow::Result<()> {
         "copy_ledger.json"
     };
     let copy_ledger = Arc::new(Mutex::new(copy_ledger::CopyLedger::load_from(ledger_path)));
+
+    // No strategy or signal producer runs before authoritative wallet/order seeds.
+    // A failed wallet read is not an empty wallet.
+    if !config.is_sim {
+        wallet_sync::seed_own_positions(&config.funder_address, state.clone()).await?;
+        wallet_sync::seed_pending_orders(clob.as_ref().expect("live client"), state.clone())
+            .await?;
+    }
 
     let mut strategy_risk = risk::RiskEngine::new(config.clone());
     strategy_risk.restore_persistent()?;
@@ -297,11 +305,6 @@ async fn main() -> anyhow::Result<()> {
     // Seed OUR positions AND live GTC orders before starting the scanner.
     // Both must complete so the scanner's first run sees accurate SkippedOwned
     // and already-queued state — preventing duplicate orders on restart.
-    if !config.is_sim {
-        wallet_sync::seed_own_positions(&config.funder_address, state.clone()).await;
-        wallet_sync::seed_pending_orders(clob.as_ref().expect("live client"), state.clone())
-            .await?;
-    }
 
     // Reconcile the copy ledger against our live wallet positions.
     // Any open ledger entry where we no longer hold the token is marked closed.
@@ -312,10 +315,13 @@ async fn main() -> anyhow::Result<()> {
             guard.positions.keys().cloned().collect()
         };
         let mut ledger = copy_ledger.lock().await;
-        ledger.reconcile(&live_token_ids);
+        if config.is_sim {
+            ledger.reconcile(&live_token_ids);
+        }
         // Prune closed entries older than configured retention period (Gap 11).
         ledger.prune_closed_older_than(config.ledger_retention_days);
     }
+    rtds::start(&config, event_tx.clone()).await?;
 
     // Ongoing wallet sync (positions, prices, balance) — all fire-and-forget loops.
     wallet_sync::start_position_sync(

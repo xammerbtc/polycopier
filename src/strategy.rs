@@ -407,6 +407,10 @@ pub fn start_strategy_engine(
             // 1. Is it a filled trade from the target wallet list?
             if crate::execution_journal::active() {
                 let guard = state.read().await;
+                if !guard.live_fills_ready {
+                    eval.validated = false;
+                    eval.reason = Some("Live fills have not been reconciled".into());
+                }
                 if crate::execution_journal::blocked()
                     || guard.foreign_order_tokens.contains(&event.token_id)
                 {
@@ -679,6 +683,17 @@ pub fn start_strategy_engine(
                             .unwrap_or(Decimal::ZERO)
                     };
 
+                    let our_held_size = if crate::execution_journal::active() {
+                        let ledger = copy_ledger.lock().await;
+                        our_held_size.min(
+                            ledger
+                                .find_active_for_token(&event.token_id)
+                                .and_then(|e| e.filled_size)
+                                .unwrap_or(Decimal::ZERO),
+                        )
+                    } else {
+                        our_held_size
+                    };
                     let truncated_size = our_held_size.trunc_with_scale(2);
                     if truncated_size <= rust_decimal::Decimal::ZERO {
                         let msg = format!("Dust fractional balance {:.4} truncates to 0.00 — skipping limit order logic.", our_held_size);
