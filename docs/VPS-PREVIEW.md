@@ -220,6 +220,30 @@ Use `target/release/relayer_preflight /opt/polycopier/.env.credentials` as root
 to check the supplied Relayer API key with the authenticated read-only
 `GET /transactions` endpoint. It prints no keys, wallet addresses or transaction
 contents, and submits no transactions. Credentials remain root-only (0600).
-Preview does not load them. A confirmed live redemption currently blocks fill
-reconciliation until redemption payout accounting is completed; gasless Redeem
-and actual copier order latency are not certified by these checks.
+Preview does not load them. Live Force Redeem pauses new execution and requires
+fresh owned inventory, finalized copier fills, a resolved binary market with
+trading closed, and no outstanding orders in either outcome. On-chain balances
+for both outcomes must exactly equal copier inventory; other bots' shares block
+redemption. SDK acknowledgement leaves the ledger open until a canonical,
+finalized receipt proves the exact owned ERC-1155 debit/burn and actual pUSD
+credit. The configured adapter's ERC-1155 permission must already be present;
+the copier does not grant approvals during redemption. SDK and receipt reads use
+`POLYGON_RPC_URL` or the public Polygon provider verified by preflight.
+Zero-payout losing positions still require a burn. Delegated adapter
+routes are traced; foreign pooling, unknown routes, amount mismatches and
+uncertain receipts fail closed. Persisted receipt proofs feed fee-inclusive
+realized PnL and deduplicated closed-position risk outcomes. The bot stays paused
+after redemption; resume requires completed reconciliation. The dashboard shows
+pending confirmation and disables retry while a receipt needs attention.
+
+`target/release/redemption_receipt_preflight` verifies an independently observed
+public target-wallet redemption receipt, without credentials or transactions.
+This proves the decoder and Polygon read path, not a redemption submitted by
+this copier. A real copier redemption and live fill-to-order latency remain
+unexecuted in this dry-run deployment. Protocol V3/PositionManager fills are not
+silently treated as CTF fills; unsupported settlement contracts block execution.
+
+As root, `runtime/node24 deploy/redeemer/preflight.mjs .env.credentials` checks
+the actual official SecureClient authentication, configured deployed Safe and
+both CTF redemption adapter permissions, without sending approvals or redeeming.
+The deployed Safe passed this check on 2026-10-11; both permissions were present.

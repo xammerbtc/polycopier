@@ -1,9 +1,14 @@
 //! SDK bridge for manually enabled Safe/Relayer redemption, with a durable no-retry journal.
 use serde_json::Value;
 use std::collections::BTreeMap;
+static JOURNAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Record {
+    #[serde(default)]
+    pub assets: BTreeMap<String, crate::redemption_settlement::Asset>,
+    #[serde(default)]
+    pub proof: Option<crate::redemption_settlement::Proof>,
     pub status: String,
     pub created_at: i64,
     pub transaction_hash: Option<String>,
@@ -37,12 +42,16 @@ pub fn configured() -> bool {
         .iter()
         .all(|key| std::env::var(key).is_ok_and(|v| !v.is_empty()))
 }
-pub async fn execute(market_id: &str) -> anyhow::Result<Value> {
+pub async fn execute(
+    market_id: &str,
+    assets: BTreeMap<String, crate::redemption_settlement::Asset>,
+) -> anyhow::Result<Value> {
     use tokio::io::AsyncWriteExt;
     anyhow::ensure!(
         configured(),
         "Live redemption credentials are not configured"
     );
+    anyhow::ensure!(!assets.is_empty(), "Redemption inventory not prepared");
     anyhow::ensure!(
         !market_id.is_empty()
             && market_id.len() <= 30
@@ -67,12 +76,23 @@ pub async fn execute(market_id: &str) -> anyhow::Result<Value> {
     journal.insert(
         market_id.into(),
         Record {
+            assets,
+            proof: None,
             status: "pending_reconciliation".into(),
             created_at: chrono::Utc::now().timestamp(),
             transaction_hash: None,
         },
     );
-    save(&journal)?;
+    {
+        let _lock = JOURNAL_LOCK.lock().unwrap();
+        let mut fresh = records()?;
+        anyhow::ensure!(
+            !fresh.contains_key(market_id),
+            "Redemption intent already exists"
+        );
+        fresh.insert(market_id.into(), journal.remove(market_id).unwrap());
+        save(&fresh)?;
+    }
     let mut stdin = child
         .stdin
         .take()
@@ -104,10 +124,45 @@ pub async fn execute(market_id: &str) -> anyhow::Result<Value> {
             && hash[2..].bytes().all(|b| b.is_ascii_hexdigit()),
         "Invalid confirmed receipt"
     );
-    journal.get_mut(market_id).unwrap().status = "confirmed".into();
-    journal.get_mut(market_id).unwrap().transaction_hash = Some(hash.into());
-    save(&journal)?;
+    {
+        let _lock = JOURNAL_LOCK.lock().unwrap();
+        let mut journal = records()?;
+        journal.get_mut(market_id).unwrap().status = "mined_pending_finality".into();
+        journal.get_mut(market_id).unwrap().transaction_hash = Some(hash.to_lowercase());
+        save(&journal)?;
+    }
     Ok(receipt)
+}
+
+pub async fn reconcile_receipts(client: &reqwest::Client, funder: &str) -> anyhow::Result<()> {
+    let rpc = std::env::var("POLYGON_RPC_URL")
+        .unwrap_or_else(|_| "https://polygon-bor-rpc.publicnode.com".into());
+    for (market, record) in records()? {
+        if record.status == "confirmed" && record.proof.is_some() {
+            continue;
+        }
+        let tx = record
+            .transaction_hash
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Uncertain redemption needs receipt reconciliation"))?;
+        let receipt = crate::live_fills::finalized_receipt(client, &rpc, tx)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Redemption is not finalized yet"))?;
+        let proof = crate::redemption_settlement::decode(&receipt, tx, funder, &record.assets)?;
+        let _lock = JOURNAL_LOCK.lock().unwrap();
+        let mut journal = records()?;
+        let current = journal
+            .get_mut(&market)
+            .ok_or_else(|| anyhow::anyhow!("Redemption intent disappeared"))?;
+        anyhow::ensure!(
+            current.transaction_hash == record.transaction_hash && current.assets == record.assets,
+            "Redemption intent changed"
+        );
+        current.proof = Some(proof);
+        current.status = "confirmed".into();
+        save(&journal)?;
+    }
+    Ok(())
 }
 pub async fn market_id(client: &reqwest::Client, token: &str) -> anyhow::Result<String> {
     let markets: Value = client

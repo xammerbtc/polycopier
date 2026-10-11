@@ -858,6 +858,10 @@ pub fn start_strategy_engine(
                     // events for the same token are blocked immediately.
                     {
                         let mut guard = state.write().await;
+                        if guard.started {
+                            tracing::info!("Execution stopped by operator pause before submission");
+                            continue;
+                        }
                         guard.in_flight_tokens.insert(order.token_id.clone());
                         guard.pending_orders.insert(
                             order.token_id.clone(),

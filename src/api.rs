@@ -104,6 +104,17 @@ async fn control(State(api): State<ApiState>, Json(payload): Json<Control>) -> R
             .into_response();
     }
     if !paused && crate::execution_journal::active() {
+        if !crate::live_redemption::records().is_ok_and(|records| {
+            records
+                .values()
+                .all(|r| r.status == "confirmed" && r.proof.is_some())
+        }) {
+            return (
+                StatusCode::CONFLICT,
+                "Redemption receipt reconciliation is pending",
+            )
+                .into_response();
+        }
         let guard = api.bot_state.read().await;
         if !guard.live_fills_ready
             || chrono::Utc::now()
@@ -242,6 +253,10 @@ async fn redeem_live(api: &ApiState) -> Response {
         )
             .into_response();
     }
+    let Some(clob) = api.live_client.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Live client unavailable").into_response();
+    };
+    let funder = std::env::var("FUNDER_ADDRESS").unwrap_or_default();
     let journal = match crate::live_redemption::records() {
         Ok(journal) => journal,
         Err(_) => {
@@ -254,16 +269,20 @@ async fn redeem_live(api: &ApiState) -> Response {
     };
     let tokens: Vec<_> = {
         let ledger = api.copy_ledger.lock().await;
-        let state = api.bot_state.read().await;
-        if !state.pending_orders.is_empty() {
+        let mut state = api.bot_state.write().await;
+        if !state.pending_orders.is_empty()
+            || !state.in_flight_tokens.is_empty()
+            || !state.live_fills_ready
+        {
             return (
                 StatusCode::CONFLICT,
                 "Wait for pending copier orders to finish",
             )
                 .into_response();
         }
+        state.started = true;
         state
-            .positions
+            .copier_positions
             .keys()
             .filter(|token| ledger.find_active_for_token(token).is_some())
             .cloned()
@@ -313,28 +332,56 @@ async fn redeem_live(api: &ApiState) -> Response {
             .into_response();
     }
     let mut receipts = Vec::new();
-    for (market_id, tokens) in markets {
+    for (market_id, _tokens) in markets {
         if journal.contains_key(&market_id) {
             continue;
         }
-        match crate::live_redemption::execute(&market_id).await {
+        let prepared = async {
+            let (fills, orders) = crate::live_fills::collect(clob, &funder).await?;
+            let book = crate::live_fills::accounted(&fills, &orders)?;
+            let (assets, all_tokens) =
+                crate::redemption_settlement::prepare(&client, &market_id, &funder, &book).await?;
+            let open = crate::execution_journal::open_orders(clob).await?;
+            anyhow::ensure!(
+                !open
+                    .iter()
+                    .any(|o| all_tokens.contains(&o.asset_id.to_string())),
+                "Market has outstanding orders"
+            );
+            for record in orders
+                .values()
+                .filter(|r| r.status == "accepted" && all_tokens.contains(&r.order.token_id))
+            {
+                let id = record
+                    .order_id
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Owned order ID missing"))?;
+                let order = tokio::time::timeout(std::time::Duration::from_secs(5), clob.order(id))
+                    .await??;
+                let settled: Decimal = fills
+                    .iter()
+                    .filter(|f| f.order_id.eq_ignore_ascii_case(id))
+                    .map(|f| f.shares)
+                    .sum();
+                anyhow::ensure!(
+                    order.id.eq_ignore_ascii_case(id) && order.size_matched == settled,
+                    "Market has unfinalized copier fills"
+                );
+            }
+            Ok::<_, anyhow::Error>(assets)
+        }
+        .await;
+        let assets=match prepared {Ok(assets)=>assets,Err(_)=>return (StatusCode::CONFLICT,"Redemption preflight failed: market must be resolved, trading closed, and all shares/fills owned and finalized").into_response()};
+        match crate::live_redemption::execute(&market_id, assets).await {
             Ok(receipt) => {
-                let mut ledger = api.copy_ledger.lock().await;
-                let mut state = api.bot_state.write().await;
-                for token in tokens {
-                    let sources: Vec<_> = ledger
-                        .entries
-                        .iter()
-                        .filter(|entry| !entry.closed && entry.token_id == token)
-                        .map(|entry| entry.source_wallet.clone())
-                        .collect();
-                    for source in sources {
-                        ledger.record_close(&token, &source);
-                    }
-                    state.positions.remove(&token);
-                    state.position_prices.remove(&token);
-                }
+                api.bot_state.write().await.live_fills_ready = false;
                 receipts.push(receipt);
+                if crate::live_fills::reconcile(clob, &funder, &api.bot_state, &api.copy_ledger)
+                    .await
+                    .is_err()
+                {
+                    return (StatusCode::ACCEPTED,Json(serde_json::json!({"mode":"live","settlement_pending":true,"on_chain_transactions":receipts.len(),"receipts":receipts}))).into_response();
+                }
             }
             Err(e) => {
                 tracing::error!("Live redemption of market {market_id} needs reconciliation: {e}");
@@ -354,6 +401,7 @@ async fn redemption_status() -> Response {
 
 #[derive(Clone)]
 pub struct ApiState {
+    pub live_client: Option<crate::clients::AuthedClobClient>,
     pub redemption_lock: Arc<tokio::sync::Mutex<()>>,
     pub bot_state: Arc<RwLock<BotState>>,
     pub copy_ledger: Arc<tokio::sync::Mutex<crate::copy_ledger::CopyLedger>>,
@@ -596,9 +644,17 @@ pub fn create_router(
     bot_state: Arc<RwLock<BotState>>,
     copy_ledger: Arc<tokio::sync::Mutex<crate::copy_ledger::CopyLedger>>,
 ) -> Router {
+    create_router_with_client(bot_state, copy_ledger, None)
+}
+pub fn create_router_with_client(
+    bot_state: Arc<RwLock<BotState>>,
+    copy_ledger: Arc<tokio::sync::Mutex<crate::copy_ledger::CopyLedger>>,
+    live_client: Option<crate::clients::AuthedClobClient>,
+) -> Router {
     use tower_http::services::{ServeDir, ServeFile};
 
     let state = ApiState {
+        live_client,
         redemption_lock: Arc::new(tokio::sync::Mutex::new(())),
         bot_state,
         copy_ledger,

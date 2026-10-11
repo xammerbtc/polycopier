@@ -262,6 +262,8 @@ pub struct Inventory {
 }
 #[derive(Default, Debug, Serialize)]
 pub struct Projection {
+    #[serde(skip)]
+    pub(crate) outcome_order: BTreeMap<String, (u64, u64, u64)>,
     pub inventory: BTreeMap<String, Inventory>,
     pub realized_pnl: Decimal,
     pub fees: Decimal,
@@ -331,11 +333,14 @@ pub fn project(fills: &[Fill], journal: &BTreeMap<String, Record>) -> anyhow::Re
                 result.realized_pnl += pnl;
                 if position.shares == Decimal::ZERO {
                     position.cost_basis = Decimal::ZERO;
-                    result.closed_outcomes.push((
-                        format!("{}:{}", fill.transaction_hash, fill.log_index),
-                        position.cycle_pnl,
-                        fill.block_timestamp,
-                    ));
+                    let id = format!("{}:{}", fill.transaction_hash, fill.log_index);
+                    result.outcome_order.insert(
+                        id.clone(),
+                        (fill.block_number, fill.transaction_index, fill.log_index),
+                    );
+                    result
+                        .closed_outcomes
+                        .push((id, position.cycle_pnl, fill.block_timestamp));
                     position.cycle_pnl = Decimal::ZERO;
                 }
             }
@@ -352,8 +357,13 @@ pub fn stored() -> anyhow::Result<Vec<Fill>> {
     }
 }
 pub fn sync_risk(risk: &mut crate::risk::RiskEngine) -> anyhow::Result<()> {
-    let book = project(&stored()?, &crate::execution_journal::snapshot()?)?;
+    let book = accounted(&stored()?, &crate::execution_journal::snapshot()?)?;
     risk.sync_live_outcomes(&book.closed_outcomes)
+}
+pub fn accounted(fills: &[Fill], journal: &BTreeMap<String, Record>) -> anyhow::Result<Projection> {
+    let mut book = project(fills, journal)?;
+    crate::redemption_settlement::apply(&mut book, &crate::live_redemption::records()?, fills)?;
+    Ok(book)
 }
 pub fn persist(fills: &[Fill]) -> anyhow::Result<()> {
     use std::io::Write;
@@ -479,7 +489,7 @@ pub async fn apply(
     state: &std::sync::Arc<tokio::sync::RwLock<crate::state::BotState>>,
     ledger: &std::sync::Arc<tokio::sync::Mutex<crate::copy_ledger::CopyLedger>>,
 ) -> anyhow::Result<()> {
-    let projection = project(fills, journal)?;
+    let projection = accounted(fills, journal)?;
     let mut latest = BTreeMap::new();
     for record in journal
         .values()
@@ -591,12 +601,11 @@ pub async fn reconcile(
     state: &std::sync::Arc<tokio::sync::RwLock<crate::state::BotState>>,
     ledger: &std::sync::Arc<tokio::sync::Mutex<crate::copy_ledger::CopyLedger>>,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !crate::live_redemption::records()?
-            .values()
-            .any(|r| r.status == "confirmed"),
-        "Redemption payout reconciliation pending"
-    );
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("polycopier-redemption-settlement/0.1")
+        .build()?;
+    crate::live_redemption::reconcile_receipts(&client, funder).await?;
     let (fills, journal) = collect(clob, funder).await?;
     apply(&fills, &journal, state, ledger).await
 }

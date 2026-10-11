@@ -16,6 +16,7 @@ pub mod order_watcher;
 pub mod position_scanner;
 pub mod prices;
 pub mod redemption;
+pub mod redemption_settlement;
 pub mod risk;
 pub mod rtds;
 pub mod simulation;

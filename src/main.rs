@@ -15,6 +15,7 @@ pub mod order_watcher;
 pub mod position_scanner;
 pub mod prices;
 pub mod redemption;
+pub mod redemption_settlement;
 pub mod risk;
 pub mod rtds;
 pub mod simulation;
@@ -373,6 +374,7 @@ async fn main() -> anyhow::Result<()> {
     // Order watcher (cancel stale GTC orders every 10 s)
     // Gap C + Gap E: now receives risk_engine Arc to call record_loss() on loss-triggered
     // cancellations, and uses exponential backoff on CLOB errors.
+    let api_client = clob.clone();
     if !config.is_sim {
         order_watcher::start_order_watcher(
             config.clone(),
@@ -384,7 +386,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── Local Web API Server ──────────────────────────────────────────────────
-    let api_router = api::create_router(state.clone(), copy_ledger.clone());
+    let api_router = api::create_router_with_client(state.clone(), copy_ledger.clone(), api_client);
     if is_ui {
         tokio::spawn(async move {
             let bind =

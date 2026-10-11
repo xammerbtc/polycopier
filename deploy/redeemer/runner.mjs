@@ -12,6 +12,7 @@ export async function redeem(request, env, dependencies) {
   validateRequest(request, env);
   const signerKey = env.PRIVATE_KEY.startsWith('0x') ? env.PRIVATE_KEY : `0x${env.PRIVATE_KEY}`;
   const client = await dependencies.createSecureClient({
+    ...(dependencies.production ? {environment:{...dependencies.production,rpc:env.POLYGON_RPC_URL || 'https://polygon-bor-rpc.publicnode.com'}} : {}),
     signer: dependencies.privateKey(signerKey), wallet: env.FUNDER_ADDRESS,
     apiKey: dependencies.relayerApiKey({key:env.POLYMARKET_RELAYER_API_KEY,address:env.POLYMARKET_RELAYER_API_KEY_ADDRESS}),
   });

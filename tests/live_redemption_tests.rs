@@ -1,3 +1,13 @@
+fn test_assets() -> std::collections::BTreeMap<String, polycopier::redemption_settlement::Asset> {
+    std::collections::BTreeMap::from([(
+        "123".into(),
+        polycopier::redemption_settlement::Asset {
+            entry_order_id: "fixture".into(),
+            shares: rust_decimal::Decimal::ONE,
+            payout_per_share: rust_decimal::Decimal::ONE,
+        },
+    )])
+}
 #[cfg(unix)]
 #[tokio::test]
 async fn confirmed_and_uncertain_intents_are_durable_and_never_automatically_retried() {
@@ -22,28 +32,38 @@ async fn confirmed_and_uncertain_intents_are_durable_and_never_automatically_ret
     ] {
         std::env::set_var(name, "test-only-value");
     }
-    assert!(polycopier::live_redemption::execute("42").await.is_err());
+    assert!(polycopier::live_redemption::execute("42", test_assets())
+        .await
+        .is_err());
     assert!(!directory.join("helper-runs").exists());
     std::env::set_var("POLYCOPIER_MODE", "live");
-    let receipt = polycopier::live_redemption::execute("42").await.unwrap();
+    let receipt = polycopier::live_redemption::execute("42", test_assets())
+        .await
+        .unwrap();
     assert_eq!(receipt["status"], "confirmed");
     assert_eq!(
         polycopier::live_redemption::records().unwrap()["42"].status,
-        "confirmed"
+        "mined_pending_finality"
     );
-    assert!(polycopier::live_redemption::execute("42").await.is_err());
+    assert!(polycopier::live_redemption::execute("42", test_assets())
+        .await
+        .is_err());
     assert_eq!(std::fs::read_to_string("helper-runs").unwrap(), "x");
     std::fs::write(
         &node,
         "#!/bin/sh\ncat >/dev/null\nprintf x >> helper-runs\nexit 1\n",
     )
     .unwrap();
-    assert!(polycopier::live_redemption::execute("43").await.is_err());
+    assert!(polycopier::live_redemption::execute("43", test_assets())
+        .await
+        .is_err());
     assert_eq!(
         polycopier::live_redemption::records().unwrap()["43"].status,
         "pending_reconciliation"
     );
-    assert!(polycopier::live_redemption::execute("43").await.is_err());
+    assert!(polycopier::live_redemption::execute("43", test_assets())
+        .await
+        .is_err());
     assert_eq!(std::fs::read_to_string("helper-runs").unwrap(), "xx");
     std::env::set_current_dir(original).unwrap();
     std::fs::remove_dir_all(directory).unwrap();
