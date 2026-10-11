@@ -9,7 +9,10 @@ pub mod log_capture;
 pub mod models;
 pub mod order_watcher;
 pub mod position_scanner;
+pub mod prices;
 pub mod risk;
+pub mod rtds;
+pub mod simulation;
 pub mod state;
 pub mod strategy;
 pub mod ui;
@@ -189,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
     // If setup is needed and the user requested the Web UI setup mode,
     // we launch a dedicated lightweight Setup API on port 3000 and suspend the backend.
     // If they run the standard `cargo run`, it ignores this and uses the terminal natively.
-    if is_ui && needs_setup {
+    if is_ui && needs_setup && !cli.is_sim {
         let setup_router = api::create_setup_router();
         tokio::spawn(async move {
             if let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:3000").await {
@@ -198,9 +201,24 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let mut config = config::Config::load_or_prompt(is_ui).await?;
+    let mut config = if cli.is_sim {
+        let cfg: config::BotConfig = toml::from_str(&std::fs::read_to_string("config.toml")?)?;
+        config::validate_config(&cfg)?;
+        config::Config::from_parts(
+            String::new(),
+            "0x0000000000000000000000000000000000000000".to_string(),
+            cfg,
+        )
+    } else {
+        config::Config::load_or_prompt(is_ui).await?
+    };
     config.is_sim = cli.is_sim;
     config.sim_balance = cli.sim_balance;
+    std::env::set_var(
+        "POLYCOPIER_MODE",
+        if config.is_sim { "simulation" } else { "live" },
+    );
+    std::env::set_var("HOT_RELOAD_ENABLED", "true");
 
     if config.is_sim {
         tracing::warn!("===========================================================");
@@ -213,18 +231,35 @@ async fn main() -> anyhow::Result<()> {
         config.is_sim,
         config.sim_balance,
     )));
+    if config.is_sim {
+        simulation::restore(&mut *state.write().await)?;
+        let snapshot_state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let guard = snapshot_state.write().await;
+                if guard.pending_orders.is_empty() {
+                    if let Err(e) = simulation::save(&guard) {
+                        tracing::error!("Simulation snapshot failed: {e}");
+                    }
+                }
+            }
+        });
+    }
     // Wrap RiskEngine in Arc<Mutex<>> so both strategy engine and order watcher
     // can reference it — order watcher calls record_loss() on loss-triggered cancels.
     let risk_engine = Arc::new(Mutex::new(risk::RiskEngine::new(config.clone())));
 
     let (poly_submitter, balance_fetcher, clob) = if config.is_sim {
-        clients::build_sim_order_submitter(&config).await?
+        let (submitter, fetcher) = clients::build_sim_order_submitter(&config).await?;
+        (submitter, fetcher, None)
     } else {
-        clients::build_order_submitter(&config).await?
+        let (submitter, fetcher, client) = clients::build_order_submitter(&config).await?;
+        (submitter, fetcher, Some(client))
     };
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(100);
-    listener::start_ws_listener(&config, event_tx.clone()).await?;
+    rtds::start(&config, event_tx.clone()).await?;
 
     // ── Copy ledger ───────────────────────────────────────────────────────────
     // Load the persisted copy ledger.  This records which positions we entered
@@ -237,14 +272,20 @@ async fn main() -> anyhow::Result<()> {
     };
     let copy_ledger = Arc::new(Mutex::new(copy_ledger::CopyLedger::load_from(ledger_path)));
 
+    let mut strategy_risk = risk::RiskEngine::new(config.clone());
+    strategy_risk.restore_persistent()?;
     strategy::start_strategy_engine(
         event_rx,
         state.clone(),
-        risk::RiskEngine::new(config.clone()),
+        strategy_risk,
         poly_submitter,
         config.clone(),
         copy_ledger.clone(),
-        strategy::make_live_holds_query(),
+        if config.is_sim {
+            strategy::make_no_op_holds_query()
+        } else {
+            strategy::make_live_holds_query()
+        },
         strategy::make_live_end_date_query(),
     );
 
@@ -254,7 +295,7 @@ async fn main() -> anyhow::Result<()> {
     // and already-queued state — preventing duplicate orders on restart.
     if !config.is_sim {
         wallet_sync::seed_own_positions(&config.funder_address, state.clone()).await;
-        wallet_sync::seed_pending_orders(&clob, state.clone()).await;
+        wallet_sync::seed_pending_orders(clob.as_ref().expect("live client"), state.clone()).await;
     }
 
     // Reconcile the copy ledger against our live wallet positions.
@@ -284,6 +325,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Position scanner — safe to start now; seed has completed.
     position_scanner::start_position_scanner(config.clone(), state.clone(), event_tx.clone());
+    prices::start(state.clone());
 
     // Position-close sweep — backstop that emits synthetic SELLs for any
     // position we hold that no target still holds (catches missed WS SELL events).
@@ -304,7 +346,7 @@ async fn main() -> anyhow::Result<()> {
     if !config.is_sim {
         order_watcher::start_order_watcher(
             config.clone(),
-            clob,
+            clob.expect("live client"),
             state.clone(),
             copy_ledger.clone(),
             risk_engine,
@@ -315,7 +357,9 @@ async fn main() -> anyhow::Result<()> {
     let api_router = api::create_router(state.clone(), copy_ledger.clone());
     if is_ui {
         tokio::spawn(async move {
-            match tokio::net::TcpListener::bind("127.0.0.1:3000").await {
+            let bind =
+                std::env::var("DASHBOARD_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+            match tokio::net::TcpListener::bind(&bind).await {
                 Ok(listener) => {
                     if let Err(e) = axum::serve(listener, api_router).await {
                         tracing::error!("Local API Server crashed: {}", e);
@@ -372,5 +416,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    state.write().await.started = true;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(25);
+    while !state.read().await.pending_orders.is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if config.is_sim {
+        simulation::save(&*state.write().await)?;
+    }
     Ok(())
 }

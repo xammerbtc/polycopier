@@ -13,14 +13,16 @@ use tracing::{error, info, warn};
 
 /// How many recent tx hashes to remember for deduplication.
 /// At 20 trades/poll x 1 poll/2s, 500 covers ~50 seconds of burst.
-const SEEN_HASHES_CAP: usize = 500;
+const SEEN_HASHES_CAP: usize = 20000;
+pub static LAST_POLL_SUCCESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static ACTIVE_TARGETS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
 
 pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) -> Result<()> {
-    let targets = config.target_wallets.clone();
+    let mut config = config.clone();
     let data_client = DataClient::default();
 
     tokio::spawn(async move {
-        info!("Started tracking third-party targets: {:?}", targets);
+        info!("Started polling target wallets");
 
         // Deduplicate by transaction hash instead of a timestamp watermark.
         // Timestamps are coarse (seconds) and drop burst trades - hashes are exact.
@@ -30,11 +32,15 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
         let mut consecutive_errors: u32 = 0;
 
         loop {
+            config.hot_reload();
+            if let Ok(mut active) = ACTIVE_TARGETS.write() {
+                *active = config.target_wallets.clone();
+            }
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
             let mut had_error = false;
 
-            for target in &targets {
+            for target in &config.target_wallets {
                 let target_addr = match Address::from_str(target) {
                     Ok(addr) => addr,
                     Err(_) => continue,
@@ -52,6 +58,10 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
 
                 let trades = match data_client.trades(&req).await {
                     Ok(t) => {
+                        LAST_POLL_SUCCESS.store(
+                            Utc::now().timestamp() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         // Success — backoff reset happens after the full loop
                         t
                     }
@@ -67,7 +77,15 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
                 };
 
                 for trade in trades {
-                    let hash = trade.transaction_hash.to_string();
+                    let hash = format!(
+                        "{}:{}:{}:{:?}:{}:{}",
+                        trade.transaction_hash,
+                        trade.proxy_wallet,
+                        trade.asset,
+                        trade.side,
+                        trade.price,
+                        trade.size
+                    );
 
                     // Skip already-processed trades
                     if seen_hashes.contains(&hash) {
@@ -89,7 +107,7 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
                     };
 
                     let event = TradeEvent {
-                        transaction_hash: hash.clone(),
+                        transaction_hash: trade.transaction_hash.to_string(),
                         // Normalize to lowercase: alloy Address::to_string() produces
                         // EIP-55 checksum (mixed-case). config.target_wallets stores
                         // lowercase strings from .env. Vec::contains is case-sensitive,

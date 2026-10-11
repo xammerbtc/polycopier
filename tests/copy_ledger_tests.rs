@@ -274,7 +274,7 @@ fn in_memory_ledger_save_does_not_write_any_file() {
 fn atomic_save_leaves_no_tmp_file_on_success() {
     let path = tmp_path("atomic");
     let _ = std::fs::remove_file(&path);
-    let tmp = format!("{}.tmp", &path);
+    let tmp = format!("{}.tmp", path);
     let _ = std::fs::remove_file(&tmp);
 
     {

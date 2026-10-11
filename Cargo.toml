@@ -29,8 +29,12 @@ alloy         = { version = "1.8.3", features = ["signers", "network"] }
 inquire       = "0.7"
 polymarket-client-sdk = { package = "polymarket_client_sdk_v2", version = "=0.6.0-canary.1", features = ["ws", "gamma", "data", "clob"] }
 axum = "0.8.8"
+base64 = "0.22"
+futures-util = "0.3"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
 tower-http = { version = "0.6.8", features = ["cors", "fs"] }
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 rust_decimal_macros = "1.35"
 tokio = { version = "1.37", features = ["full", "test-util"] }

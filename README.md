@@ -1,5 +1,11 @@
 # polycopier
 
+For the isolated, authenticated VPS dry-run deployment, see
+[VPS preview deployment](docs/VPS-PREVIEW.md). It adds public RTDS WebSocket
+monitoring with polling fallback, live config reload, dashboard controls and
+persistent paper/risk state. Simulation does not require a wallet key or CLOB
+authentication. Always verify this mode before considering any live execution.
+
 <p align="center">
   <img src="poly_ui.png" alt="Polycopier Web UI" width="48%">
   &nbsp;

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import SettingsManager from './SettingsManager';
 import SetupWizard from './SetupWizard';
+import Operations from './Operations';
 
 function App() {
   const [state, setState] = useState<any>(null);
@@ -96,17 +97,19 @@ function App() {
         <div className="header-title" style={{ display: 'flex', justifyContent: 'space-between', width: '100%' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
             <h1>Polycopier</h1>
-            <div className="live-badge">LIVE</div>
+            <div className="live-badge">{state.mode === 'simulation' ? 'DRY-RUN / SIMULATION' : state.mode.toUpperCase()}</div>
+            <button className="btn btn-secondary" onClick={() => fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({action:state.paused ? 'resume' : 'pause'})})}>{state.paused ? 'Resume' : 'Pause'}</button>
+            <span>{state.paused ? 'Paused' : 'Running'}</span>
           </div>
           <div className="nav-tabs">
             <button className={`nav-tab ${activeTab === 'dashboard' ? 'active' : ''}`} onClick={() => setActiveTab('dashboard')}>Dashboard</button>
-            <button className={`nav-tab ${activeTab === 'settings' ? 'active' : ''}`} onClick={() => setActiveTab('settings')}>Settings & Env</button>
+            <button className={`nav-tab ${activeTab === 'settings' ? 'active' : ''}`} onClick={() => setActiveTab('settings')}>Targets & Settings</button>
           </div>
         </div>
         
         <div className="stats-grid">
           <div className="stat-card">
-            <span className="stat-label">Total Balance</span>
+            <span className="stat-label">{state.mode === 'simulation' ? 'Paper Balance' : 'Total Balance'}</span>
             <span className="stat-value">${parseFloat(state.total_balance).toFixed(2)}</span>
           </div>
           <div className="stat-card">
@@ -127,15 +130,18 @@ function App() {
             <span className="stat-label">Next Scan</span>
             <span className="stat-value">{state.next_scan_secs}s</span>
           </div>
+          <div className="stat-card"><span className="stat-label">Realized PnL</span><span className="stat-value">${parseFloat(state.realized_pnl).toFixed(2)}</span></div>
+          <div className="stat-card"><span className="stat-label">Daily Volume</span><span className="stat-value">${parseFloat(state.daily_volume_usd).toFixed(2)}</span></div>
         </div>
       </header>
 
       {activeTab === 'dashboard' ? (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
           {/* Our Open Positions - FULL WIDTH */}
+          <Operations />
           <div className="glass-panel">
             <div className="panel-header">
-              Our Positions
+              {state.mode === 'simulation' ? 'Paper Positions' : 'Our Positions'}
               <span className="panel-subtitle">Held: {Object.keys(state.positions || {}).length}</span>
             </div>
             <div className="table-container">
@@ -146,6 +152,7 @@ function App() {
                     <th>Source</th>
                     <th>Size</th>
                     <th>Our Avg</th>
+                    <th>Current Price</th>
                     <th>Target Avg</th>
                     <th>Diff %</th>
                     <th>Live PnL</th>
@@ -160,7 +167,8 @@ function App() {
                     const shortWallet = sourceWallet === 'Unknown' ? 'Unknown' : `${sourceWallet.substring(0, 6)}...${sourceWallet.substring(sourceWallet.length - 4)}`;
                     const ourAvg = parseFloat(p.average_entry_price);
                     const targetAvg = t ? parseFloat(t.avg_price) : 0;
-                    const curPrice = t ? parseFloat(t.cur_price) : ourAvg;
+                    const hasPrice = state.position_prices?.[p.token_id] !== undefined || !!t;
+                    const curPrice = state.position_prices?.[p.token_id] !== undefined ? parseFloat(state.position_prices[p.token_id]) : t ? parseFloat(t.cur_price) : ourAvg;
                     const diffPct = targetAvg > 0 ? ((ourAvg - targetAvg) / targetAvg) * 100 : 0;
                     const pnlUsd = (curPrice - ourAvg) * parseFloat(p.size);
                     const pnlPct = ourAvg > 0 ? ((curPrice - ourAvg) / ourAvg) * 100 : 0;
@@ -180,19 +188,20 @@ function App() {
                         </td>
                         <td>{parseFloat(p.size).toFixed(2)}</td>
                         <td>${ourAvg.toFixed(3)}</td>
+                        <td>{hasPrice ? `$${curPrice.toFixed(3)}` : 'Unavailable'}</td>
                         <td>{targetAvg > 0 ? `$${targetAvg.toFixed(3)}` : '-'}</td>
                         <td className={targetAvg > 0 ? (diffPct > 0 ? 'val-negative' : 'val-positive') : ''}>
                           {targetAvg > 0 ? `${diffPct > 0 ? '+' : ''}${diffPct.toFixed(1)}%` : '-'}
                         </td>
                         <td className={pnlUsd !== 0 ? (pnlUsd > 0 ? 'val-positive' : 'val-negative') : ''}>
-                          {pnlUsd > 0 ? '+' : ''}${pnlUsd.toFixed(2)} ({pnlPct > 0 ? '+' : ''}{pnlPct.toFixed(1)}%)
+                          {hasPrice ? `${pnlUsd > 0 ? '+' : ''}$${pnlUsd.toFixed(2)} (${pnlPct > 0 ? '+' : ''}${pnlPct.toFixed(1)}%)` : 'Unavailable'}
                         </td>
                         <td><span className="status status-HELD">HELD</span></td>
                       </tr>
                     );
                   })}
                   {Object.keys(state.positions || {}).length === 0 && (
-                    <tr><td colSpan={8} style={{ textAlign: 'center', color: 'var(--text-secondary)' }}>No open positions</td></tr>
+                    <tr><td colSpan={9} style={{ textAlign: 'center', color: 'var(--text-secondary)' }}>No open positions</td></tr>
                   )}
                 </tbody>
               </table>
@@ -205,9 +214,9 @@ function App() {
             {/* Active API Limit Orders */}
             <div className="glass-panel">
               <div className="panel-header">
-                Active API Limits
+                {state.mode === 'simulation' ? 'Paper pending orders' : 'Active API Limits'}
                 <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-                  <span className="live-badge" style={{ fontSize: '0.6rem', padding: '2px 4px' }}>LIVE BOOK</span>
+                  <span className="live-badge" style={{ fontSize: '0.6rem', padding: '2px 4px' }}>{state.mode === 'simulation' ? 'SIMULATION' : 'LIVE BOOK'}</span>
                   <span className="panel-subtitle">Pending: {(state.active_orders || []).length}</span>
                 </div>
               </div>

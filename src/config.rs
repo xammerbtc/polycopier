@@ -344,7 +344,8 @@ retention_days = {retention}
         cooldown = cfg.risk.loss_cooldown_secs,
         retention = cfg.ledger.retention_days,
     );
-    fs::write(CONFIG_TOML_PATH, content)?;
+    fs::write("config.toml.tmp", content)?;
+    fs::rename("config.toml.tmp", CONFIG_TOML_PATH)?;
     Ok(())
 }
 
@@ -674,7 +675,7 @@ impl Config {
     }
 
     /// Build a flat [`Config`] from secrets + a [`BotConfig`].
-    fn from_parts(private_key: String, funder_address: String, cfg: BotConfig) -> Self {
+    pub fn from_parts(private_key: String, funder_address: String, cfg: BotConfig) -> Self {
         let mut target_wallets = Vec::new();
         let mut target_scalars = std::collections::HashMap::new();
 
@@ -685,10 +686,12 @@ impl Config {
             }
             if let Some((addr, scalar_str)) = s.split_once(':') {
                 let clean_addr = addr.trim().to_string();
-                target_wallets.push(clean_addr.clone());
                 let scalar = rust_decimal::Decimal::from_str(scalar_str.trim())
                     .unwrap_or(rust_decimal::Decimal::ONE);
-                target_scalars.insert(clean_addr, scalar);
+                if scalar > Decimal::ZERO {
+                    target_wallets.push(clean_addr.clone());
+                    target_scalars.insert(clean_addr, scalar);
+                }
             } else {
                 target_wallets.push(s.clone());
                 target_scalars.insert(s, rust_decimal::Decimal::ONE);
@@ -738,6 +741,73 @@ impl Config {
         let cfg = load_toml()?;
         Ok(Self::from_parts(private_key, funder_address, cfg))
     }
+
+    /// Reload only public tunables; credentials and execution mode stay fixed.
+    pub fn hot_reload(&mut self) {
+        if env::var("HOT_RELOAD_ENABLED").as_deref() != Ok("true") {
+            return;
+        }
+        if let Ok(cfg) = load_toml() {
+            if validate_config(&cfg).is_ok() {
+                let mut next =
+                    Self::from_parts(self.private_key.clone(), self.funder_address.clone(), cfg);
+                next.is_sim = self.is_sim;
+                next.sim_balance = self.sim_balance;
+                *self = next;
+            }
+        }
+    }
+}
+
+pub fn validate_config(cfg: &BotConfig) -> anyhow::Result<()> {
+    for target in &cfg.targets.wallets {
+        let (address, scalar) = target
+            .split_once(':')
+            .map_or((target.as_str(), None), |(a, s)| (a, Some(s)));
+        let hex = address.strip_prefix("0x").unwrap_or("");
+        anyhow::ensure!(
+            hex.len() == 40 && hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "Invalid target address"
+        );
+        if let Some(s) = scalar {
+            anyhow::ensure!(
+                Decimal::from_str(s)? >= Decimal::ZERO,
+                "Scalar must be nonnegative (0 disables wallet)"
+            );
+        }
+    }
+    let unit = |x: Decimal| x >= Decimal::ZERO && x <= Decimal::ONE;
+    anyhow::ensure!(
+        unit(cfg.execution.max_slippage_pct) && unit(cfg.execution.sell_fee_buffer),
+        "Execution fractions must be between 0 and 1"
+    );
+    anyhow::ensure!(
+        cfg.execution.max_trade_size_usd > Decimal::ZERO && cfg.execution.max_delay_seconds > 0,
+        "Trade size and delay must be positive"
+    );
+    anyhow::ensure!(
+        cfg.risk.max_daily_volume_usd >= Decimal::ZERO,
+        "Daily volume must be nonnegative"
+    );
+    anyhow::ensure!(
+        unit(cfg.scanner.max_copy_loss_pct) && unit(cfg.scanner.max_copy_gain_pct),
+        "Scanner fractions must be between 0 and 1"
+    );
+    anyhow::ensure!(
+        unit(cfg.scanner.min_entry_price)
+            && unit(cfg.scanner.max_entry_price)
+            && cfg.scanner.min_entry_price < cfg.scanner.max_entry_price,
+        "Invalid entry price range"
+    );
+    anyhow::ensure!(
+        cfg.sizing.copy_size_pct.is_none_or(unit),
+        "Copy fraction must be between 0 and 1"
+    );
+    anyhow::ensure!(
+        ["self_pct", "target_usd", "target_scalar", "fixed"].contains(&cfg.sizing.mode.as_str()),
+        "Unknown sizing mode"
+    );
+    Ok(())
 }
 
 // ────────────────────────────────────────────────────────────────────────

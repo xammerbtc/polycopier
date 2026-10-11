@@ -340,7 +340,7 @@ pub fn start_strategy_engine(
     state: Arc<RwLock<BotState>>,
     mut risk_engine: RiskEngine,
     submitter: OrderSubmitter,
-    config: Config,
+    mut config: Config,
     copy_ledger: Arc<Mutex<CopyLedger>>,
     holds_query: HoldsQuery,
     end_date_query: EndDateQuery,
@@ -353,8 +353,18 @@ pub fn start_strategy_engine(
         let mut end_date_cache = EndDateCache::new();
         // Periodic cache maintenance counter
         let mut event_count: u32 = 0;
+        let (outcome_tx, mut outcome_rx) = mpsc::unbounded_channel::<Decimal>();
 
         while let Some(event) = rx.recv().await {
+            while let Ok(pnl) = outcome_rx.try_recv() {
+                if pnl < Decimal::ZERO {
+                    risk_engine.record_loss();
+                } else if pnl > Decimal::ZERO {
+                    risk_engine.record_win();
+                }
+            }
+            config.hot_reload();
+            risk_engine.update_config(config.clone());
             event_count += 1;
             // Evict expired live-query cache entries every 50 events (Gap 13)
             if event_count.is_multiple_of(50) {
@@ -366,6 +376,11 @@ pub fn start_strategy_engine(
                 validated: true,
                 reason: None,
             };
+
+            if state.read().await.started {
+                eval.validated = false;
+                eval.reason = Some("Operator paused".to_string());
+            }
 
             // 1. Is it a filled trade from the target wallet list?
             if !config.target_wallets.contains(&event.taker_address) {
@@ -384,7 +399,7 @@ pub fn start_strategy_engine(
 
             // 3. Risk bounds
             if eval.validated {
-                if let Err(reason) = risk_engine.check_trade(&event) {
+                if let Err(reason) = risk_engine.check_signal(&event) {
                     eval.validated = false;
                     eval.reason = Some(reason);
                 }
@@ -448,7 +463,11 @@ pub fn start_strategy_engine(
                 };
 
                 // Check live-query cache before making API calls (Gap 13)
-                let our_cached = live_cache.get(&config.funder_address, &event.token_id);
+                let our_cached = if config.is_sim {
+                    Some(cache_we_hold)
+                } else {
+                    live_cache.get(&config.funder_address, &event.token_id)
+                };
                 let target_cached = live_cache.get(&event.taker_address, &event.token_id);
 
                 let (live_we_hold, live_target_holds) = if our_cached.is_some()
@@ -659,8 +678,9 @@ pub fn start_strategy_engine(
                     );
                     // Budget exactly reflects the sizing engine's mathematical intent.
                     // (TargetUSD mirrors natively, Scalars scale natively, Fixed/SelfPct override natively)
-                    let raw_size = budget_usd / event.price;
-                    let buy_size = raw_size.round_dp(2); // CLOB requires 2dp lot size
+                    let raw_size = budget_usd / limit_price;
+                    let buy_size =
+                        raw_size.round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero);
 
                     // CLOB hard minimum: 5 shares. Orders below this always 400.
                     if buy_size < MIN_ORDER_SHARES {
@@ -739,6 +759,17 @@ pub fn start_strategy_engine(
                 };
 
                 if let Some((order, cost_to_deduct)) = order {
+                    let mut execution = event.clone();
+                    execution.price = order.price;
+                    execution.size = order.size;
+                    if let Err(reason) = risk_engine.check_execution(&execution) {
+                        state.write().await.push_evaluated_trade(EvaluatedTrade {
+                            original_event: event.clone(),
+                            validated: false,
+                            reason: Some(reason),
+                        });
+                        continue;
+                    }
                     // Register token as pending BEFORE spawning so any concurrent
                     // events for the same token are blocked immediately.
                     {
@@ -782,6 +813,7 @@ pub fn start_strategy_engine(
                     };
 
                     let is_sim = config.is_sim;
+                    let outcome_tx = outcome_tx.clone();
 
                     tokio::spawn(async move {
                         match submitter_clone(order).await {
@@ -797,6 +829,13 @@ pub fn start_strategy_engine(
                                     // Accumulate realized PnL
                                     if let Some(avg_entry) = entry_price {
                                         let pnl = (order_price - avg_entry) * order_size;
+                                        if is_sim {
+                                            let fee = order_size
+                                                * Decimal::new(2, 2)
+                                                * order_price
+                                                * (Decimal::ONE - order_price);
+                                            let _ = outcome_tx.send(pnl - fee);
+                                        }
                                         let mut guard = state_clone.write().await;
                                         guard.realized_pnl += pnl;
                                         // Subtract this token's contribution from unrealized;

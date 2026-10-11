@@ -33,26 +33,17 @@ export default function SettingsManager() {
           .filter(Boolean);
       }
 
-      await fetch("/api/config", {
+      const response = await fetch("/api/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payloadConfig),
       });
 
-      await fetch("/api/env", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(envData),
-      });
-
-      if (confirm("Settings successfully flushed to disk. Restart the background engine to apply the changes?")) {
-        await fetch("/api/action/restart", { method: "POST" });
-        setMessage("Daemon restart signal sent.");
-      } else {
-        setMessage("Saved successfully! Restart later to apply.");
-      }
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Save failed");
+      setMessage("Saved. Targets and risk settings apply automatically without restarting.");
     } catch (e) {
-      setMessage("Failed to save.");
+      setMessage(e instanceof Error ? e.message : "Failed to save.");
     }
 
     setIsSaving(false);
@@ -68,11 +59,12 @@ export default function SettingsManager() {
   return (
     <div className="settings-container">
       <div className="glass-panel" style={{ marginBottom: "1.5rem" }}>
-        <div className="panel-header">Environment Secrets</div>
+        <div className="panel-header">Credentials managed on VPS</div>
         <div className="form-group">
-          <label>Private Key (Polymarket Signer)</label>
+          <label>Private keys are never returned by the dashboard API</label>
           <input
             type="password"
+            disabled
             value={envData.private_key}
             onChange={(e) => setEnvData({ ...envData, private_key: e.target.value })}
             placeholder="0x..."
@@ -82,6 +74,7 @@ export default function SettingsManager() {
           <label>Funder Wallet Address (Polymarket Proxy)</label>
           <input
             type="text"
+            disabled
             value={envData.funder_address}
             onChange={(e) => setEnvData({ ...envData, funder_address: e.target.value })}
             placeholder="0x..."
@@ -106,6 +99,11 @@ export default function SettingsManager() {
                 
                 return (
                 <div key={idx} style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.5rem' }}>
+                  <button className="btn btn-secondary" onClick={() => {
+                    const next = [...config.targets.wallets];
+                    next[idx] = `${cleanWallet}:${parseFloat(cleanScalar) === 0 ? '1' : '0'}`;
+                    setConfig({...config, targets:{...config.targets, wallets:next}});
+                  }}>{parseFloat(cleanScalar) === 0 ? 'Enable' : 'Disable'}</button>
                   <input
                     type="text"
                     value={cleanWallet}
@@ -196,6 +194,7 @@ export default function SettingsManager() {
 
           <div className="glass-panel">
             <div className="panel-header">Scanner Tuning</div>
+            <label><input type="checkbox" checked={config.scanner.max_entries_per_cycle > 0} onChange={e => setConfig({...config, scanner:{...config.scanner, max_entries_per_cycle:e.target.checked ? 1 : 0}})} /> Catch-up entries enabled</label>
             <div className="form-group">
               <label>Max Entries Per Scan Cycle</label>
               <input

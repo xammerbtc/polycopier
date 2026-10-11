@@ -1,0 +1,9 @@
+/opt/polycopier/polycopier.log {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    copytruncate
+    su polycopier polycopier
+}

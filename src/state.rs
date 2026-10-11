@@ -5,6 +5,8 @@ use std::time::Instant;
 
 pub struct BotState {
     pub positions: HashMap<String, Position>,
+    pub position_prices: HashMap<String, Decimal>,
+    pub prices_updated_at: u64,
     pub live_feed: VecDeque<EvaluatedTrade>,
     pub active_orders: Vec<ActiveApiOrder>,
     pub total_balance: Decimal,
@@ -49,6 +51,8 @@ impl BotState {
 
         Self {
             positions: HashMap::new(),
+            position_prices: HashMap::new(),
+            prices_updated_at: 0,
             live_feed: VecDeque::with_capacity(100),
             active_orders: Vec::new(),
             total_balance: initial_balance,

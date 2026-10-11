@@ -1129,7 +1129,7 @@ mod strategy_engine_tests {
             guard.total_balance = dec!(100);
         }
 
-        // 100 shares * $0.40 = $40 - capped to 10/0.40 = 25 shares
+        // The $10 cap applies at our limit price, including the slippage buffer.
         tx.send(make_trade("0xabc", dec!(0.40), dec!(100), TradeSide::BUY))
             .await
             .unwrap();
@@ -1137,7 +1137,9 @@ mod strategy_engine_tests {
 
         let orders = log.lock().unwrap();
         assert_eq!(orders.len(), 1);
-        assert_eq!(orders[0].size, dec!(25));
+        let notional = orders[0].size * orders[0].price;
+        assert!(notional <= dec!(10));
+        assert!(notional > dec!(9.99));
     }
 
     #[tokio::test]

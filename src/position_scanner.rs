@@ -77,7 +77,7 @@ pub fn classify_position(
 }
 
 pub fn start_position_scanner(
-    config: Config,
+    mut config: Config,
     state: Arc<RwLock<BotState>>,
     tx: mpsc::Sender<TradeEvent>,
 ) {
@@ -112,6 +112,7 @@ pub fn start_position_scanner(
         let mut consecutive_errors: u32 = 0;
 
         loop {
+            config.hot_reload();
             // Compute next sleep based on how enterable the target's open positions still are.
             let adaptive_interval = {
                 let guard = state.read().await;
@@ -157,6 +158,7 @@ pub fn start_position_scanner(
                 g.next_scan_secs = sleep_secs;
             }
             tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+            config.hot_reload();
 
             match scan_positions(&config, &state, &tx, &mut already_queued).await {
                 Ok(()) => {

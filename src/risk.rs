@@ -15,6 +15,7 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::time::Instant;
 
+#[derive(Clone)]
 pub struct RiskEngine {
     config: Config,
 
@@ -38,6 +39,87 @@ pub struct RiskEngine {
 }
 
 impl RiskEngine {
+    fn persist(&self) {
+        let Ok(path) = std::env::var("RISK_STATE_PATH") else {
+            return;
+        };
+        let until = self.cooldown_until.map(|t| {
+            chrono::Utc::now().timestamp()
+                + t.saturating_duration_since(Instant::now()).as_secs() as i64
+        });
+        let raw = serde_json::json!({"date":self.daily_reset_date,"volume":self.daily_volume_usd,"losses":self.consecutive_losses,"cooldown_until":until});
+        let result = std::fs::write(format!("{path}.tmp"), raw.to_string())
+            .and_then(|_| std::fs::rename(format!("{path}.tmp"), path));
+        if let Err(e) = result {
+            tracing::error!("Risk state persistence failed: {e}");
+        }
+    }
+
+    pub fn restore_persistent(&mut self) -> anyhow::Result<()> {
+        let Ok(path) = std::env::var("RISK_STATE_PATH") else {
+            return Ok(());
+        };
+        let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let v: serde_json::Value = serde_json::from_str(&raw)?;
+        let date: chrono::NaiveDate = serde_json::from_value(v["date"].clone())?;
+        if date == chrono::Utc::now().date_naive() {
+            self.daily_volume_usd = serde_json::from_value(v["volume"].clone())?;
+            self.consecutive_losses = serde_json::from_value(v["losses"].clone())?;
+            if let Some(until) = v["cooldown_until"].as_i64() {
+                let remaining = until - chrono::Utc::now().timestamp();
+                if remaining > 0 {
+                    self.cooldown_until =
+                        Some(Instant::now() + std::time::Duration::from_secs(remaining as u64));
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Evaluate target-specific checks without charging target notional to our budget.
+    pub fn check_signal(&self, event: &TradeEvent) -> Result<(), String> {
+        self.check_age(event)?;
+        let mut preview = self.clone();
+        preview.config.max_daily_volume_usd = Decimal::ZERO;
+        preview.check_trade(event)
+    }
+
+    pub fn check_execution(&mut self, event: &TradeEvent) -> Result<(), String> {
+        self.check_age(event)?;
+        let losses = self.consecutive_losses;
+        let min = self.config.scan_min_amount;
+        let max = self.config.scan_max_amount;
+        self.config.scan_min_amount = Decimal::ZERO;
+        self.config.scan_max_amount = Decimal::MAX;
+        let result = self.check_trade(event);
+        if result.is_ok() && event.side == TradeSide::BUY && self.cooldown_until.is_none() {
+            self.consecutive_losses = losses;
+        }
+        self.config.scan_min_amount = min;
+        self.config.scan_max_amount = max;
+        self.persist();
+        result
+    }
+    pub fn update_config(&mut self, config: Config) {
+        self.config = config;
+    }
+    fn check_age(&self, event: &TradeEvent) -> Result<(), String> {
+        let age = chrono::Utc::now().timestamp() - event.timestamp;
+        if age < -1 || age > self.config.max_delay_seconds {
+            return Err(format!(
+                "Stale signal: age {age}s exceeds allowed {}s",
+                self.config.max_delay_seconds
+            ));
+        }
+        Ok(())
+    }
+    pub fn record_win(&mut self) {
+        self.consecutive_losses = 0;
+        self.persist();
+    }
     pub fn new(config: Config) -> Self {
         Self {
             config,
@@ -161,5 +243,6 @@ impl RiskEngine {
                 self.config.loss_cooldown_secs
             );
         }
+        self.persist();
     }
 }

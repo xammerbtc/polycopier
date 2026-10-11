@@ -27,7 +27,18 @@ sim_copy_ledger.json
 .DS_Store
 
 # Rust
-Cargo.lock
+# Cargo.lock is tracked to make VPS builds reproducible.
+.cargo-registry/
+build.exit
+build.phase
+changes.tar
+simulation_state.json
+runtime-risk.json
+.env.credentials
+verification.json
+public-target-latest.json
+source-verified.tar
+deploy-backups/
 .agents/
 
 src/bin/order_test.rs
