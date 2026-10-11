@@ -52,11 +52,36 @@ pub fn dispatch(event: &TradeEvent) {
     metrics.last_receive_to_dispatch_ms =
         observation.map(|(when, _)| when.elapsed().as_millis() as u64);
     metrics.last_source = observation.map(|(_, source)| source.to_string());
-    metrics.last_fill_to_dispatch_upper_bound_ms =
-        Some(chrono::Utc::now().timestamp_millis() - event.timestamp.saturating_mul(1000));
+    metrics.last_fill_to_dispatch_upper_bound_ms = observation
+        .map(|_| chrono::Utc::now().timestamp_millis() - event.timestamp.saturating_mul(1000));
     metrics.last_dispatch_at = Some(chrono::Utc::now().timestamp_millis());
     tracing::info!("Order latency: source={:?} receive_to_dispatch_ms={:?} fill_to_dispatch_upper_bound_ms={:?}", metrics.last_source, metrics.last_receive_to_dispatch_ms, metrics.last_fill_to_dispatch_upper_bound_ms);
 }
 pub fn snapshot() -> Metrics {
     METRICS.lock().unwrap().clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn synthetic_events_cannot_be_reported_as_measured_fill_latency() {
+        let event = TradeEvent {
+            transaction_hash: "latency-test".into(),
+            maker_address: "wallet".into(),
+            taker_address: "wallet".into(),
+            token_id: "token".into(),
+            price: rust_decimal::Decimal::ONE,
+            size: rust_decimal::Decimal::ONE,
+            side: crate::models::TradeSide::BUY,
+            timestamp: chrono::Utc::now().timestamp(),
+        };
+        dispatch(&event);
+        assert_eq!(snapshot().last_fill_to_dispatch_upper_bound_ms, None);
+        receive(&event, "websocket");
+        dispatch(&event);
+        assert_eq!(snapshot().last_source.as_deref(), Some("websocket"));
+        assert!(snapshot().last_fill_to_dispatch_upper_bound_ms.is_some());
+        assert!(snapshot().last_receive_to_dispatch_ms.is_some());
+    }
 }

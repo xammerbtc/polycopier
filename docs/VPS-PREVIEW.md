@@ -107,8 +107,10 @@ This preview never submits an on-chain redemption.
 Metrics distinguish websocket and polling observations. Fill timestamps have
 one-second precision, so fill-to-dispatch is reported as an upper bound, while
 receive-to-dispatch uses a monotonic clock. These are dispatch observations,
-not confirmation of a live order accepted by the exchange. A null observation
-means no qualifying order has been dispatched since startup.
+not confirmation of a live order accepted by the exchange. A null fill-latency
+field means the latest dispatch has no matching observed target fill.
+Synthetic catch-up and position-sweep orders are counted as dispatches but have
+null fill-latency fields; their generated timestamps cannot prove RTDS latency.
 
 ## Dependency audit
 
