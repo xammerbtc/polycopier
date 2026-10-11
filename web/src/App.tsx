@@ -115,7 +115,7 @@ function App() {
           <div className="stat-card">
             <span className="stat-label">Unrealized PnL</span>
             <span className={`stat-value ${parseFloat(state.unrealized_pnl) < 0 ? 'val-negative' : parseFloat(state.unrealized_pnl) > 0 ? 'val-positive' : 'val-neutral'}`}>
-              ${parseFloat(state.unrealized_pnl).toFixed(2)}
+              {Object.keys(state.positions || {}).every(id => state.position_prices?.[id] !== undefined) ? `$${parseFloat(state.unrealized_pnl).toFixed(2)}` : 'Prices unavailable'}
             </span>
           </div>
           <div className="stat-card">

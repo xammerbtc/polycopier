@@ -19,7 +19,7 @@ g diff --check > diff-check.log
 g switch codex/vps-preview 2>/dev/null || g switch -c codex/vps-preview
 g config user.name 'Codex'
 g config user.email 'codex@users.noreply.github.com'
-g add src tests Cargo.toml Cargo.lock deploy web/src .gitignore .env.example README.md docs/VPS-PREVIEW.md
+g add src tests Cargo.toml Cargo.lock deploy web/src web/package.json web/package-lock.json .gitignore .env.example README.md docs/VPS-PREVIEW.md
 python3 deploy/check-staged-secrets.py
 g diff --cached --check
 g commit -m 'feat: deploy authenticated dry-run copier with RTDS and persistent state'

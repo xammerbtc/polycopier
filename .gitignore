@@ -39,6 +39,10 @@ verification.json
 public-target-latest.json
 source-verified.tar
 deploy-backups/
+dummy.json
+npm-audit.json
+rust-audit.json
+rust-audit.exit
 .agents/
 
 src/bin/order_test.rs
