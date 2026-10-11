@@ -244,9 +244,10 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                let guard = snapshot_state.write().await;
+                let mut guard = snapshot_state.write().await;
                 if guard.pending_orders.is_empty() {
-                    if let Err(e) = simulation::save(&guard) {
+                    if let Err(e) = simulation::commit(&mut guard) {
+                        guard.started = true;
                         tracing::error!("Simulation snapshot failed: {e}");
                     }
                 }
@@ -455,7 +456,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     if config.is_sim {
-        simulation::save(&*state.write().await)?;
+        simulation::commit(&mut *state.write().await)?;
     }
     Ok(())
 }

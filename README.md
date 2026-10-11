@@ -250,7 +250,7 @@ On first run, if `config.toml` is missing the bot auto-generates it from default
 | `max_slippage_pct` | `0.02` | Slippage buffer added to the target's avg entry price for limit orders (2% = `0.02`) |
 | `max_trade_size_usd` | `10.00` | Maximum USDC to spend per copied trade (hard ceiling for all sizing modes) |
 | `max_delay_seconds` | `10` | Discard live trade events older than this many seconds (staleness filter) |
-| `sell_fee_buffer` | `0.97` | `sell_size = held × buffer` — absorbs ~3% CLOB fee. Default `0.97` |
+| `sell_fee_buffer` | `0.97` | `sell_size = owned shares × buffer`; remaining shares stay active until a later sale or redemption. Fees are deducted separately from proceeds. |
 | `ignore_closing_in_mins` | `15` | Skip entries and cancel pending orders for markets that close within this many minutes. Omit to disable. |
 
 #### `[sizing]`

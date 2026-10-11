@@ -564,10 +564,10 @@ mod strategy_tests {
 
     #[test]
     fn slippage_applied_to_high_price() {
-        // $0.90 + 2% = $0.918, rounded to 2dp = $0.92
+        // $0.918 rounds down to $0.91 to keep the 2% ceiling.
         assert_eq!(
             calculate_limit_price(dec!(0.90), TradeSide::BUY, dec!(0.02)),
-            dec!(0.92)
+            dec!(0.91)
         );
     }
 
@@ -924,8 +924,8 @@ mod scanner_avg_price_tests {
             "avg-based limit {limit_from_avg} should be below cur-based limit {limit_from_cur}"
         );
 
-        // Limit should be avg_price * 1.02 = 0.89 * 1.02 = 0.9078 -> rounds to 0.91
-        assert_eq!(limit_from_avg, dec!(0.91));
+        // 0.9078 rounds down to 0.90 to keep the 2% ceiling.
+        assert_eq!(limit_from_avg, dec!(0.90));
     }
 
     // When target is DOWN from their entry (cur_price < avg_price):
@@ -938,8 +938,8 @@ mod scanner_avg_price_tests {
 
         let limit = calculate_limit_price(avg_price, TradeSide::BUY, dec!(0.02));
 
-        // Limit = 0.89 * 1.02 = 0.9078 -> 0.91
-        assert_eq!(limit, dec!(0.91));
+        // Limit = 0.89 * 1.02 = 0.9078 -> 0.90
+        assert_eq!(limit, dec!(0.90));
 
         // The limit (0.91) is > cur_price (0.80), so the CLOB fills at 0.80
         // (the current ask), which is better than the target's avg of 0.89
@@ -1251,7 +1251,7 @@ mod strategy_engine_tests {
         assert_eq!(orders.len(), 1, "expected exactly one SELL order");
         assert_eq!(
             orders[0].size,
-            dec!(20),
+            dec!(19.40),
             "should be 20 * 0.97, not 500 * 0.97"
         );
         assert_eq!(orders[0].side, TradeSide::SELL);
@@ -1292,7 +1292,7 @@ mod strategy_engine_tests {
 
         let orders = log.lock().unwrap();
         assert_eq!(orders.len(), 1);
-        assert_eq!(orders[0].size, dec!(10));
+        assert_eq!(orders[0].size, dec!(9.70));
     }
 
     #[tokio::test]
@@ -1452,7 +1452,7 @@ mod strategy_engine_tests {
         assert_eq!(orders.len(), 1);
         // Should use OUR held size (15), not target's size (3)
         // 15 * 0.97 = 14.55
-        assert_eq!(orders[0].size, dec!(15));
+        assert_eq!(orders[0].size, dec!(14.55));
         // Crucially, sell size must never exceed what we hold
         assert!(
             orders[0].size <= dec!(15),
@@ -1662,7 +1662,7 @@ mod strategy_engine_tests {
         .await
         .unwrap();
         let guard = state.read().await;
-        assert_eq!(guard.positions["99999"].size, dec!(0.003));
+        assert_eq!(guard.positions["99999"].size, dec!(0.603));
         assert_eq!(
             ledger
                 .lock()
@@ -1670,11 +1670,14 @@ mod strategy_engine_tests {
                 .find_active_for_token("99999")
                 .unwrap()
                 .filled_size,
-            Some(dec!(0.003))
+            Some(dec!(0.603))
         );
-        let fee = (dec!(20) * dec!(0.02) * dec!(0.59) * dec!(0.41)).round_dp(5);
-        assert_eq!(guard.total_balance, dec!(100) + dec!(20) * dec!(0.59) - fee);
-        assert_eq!(guard.realized_pnl, dec!(20) * dec!(0.09) - fee);
+        let fee = (dec!(19.40) * dec!(0.02) * dec!(0.59) * dec!(0.41)).round_dp(5);
+        assert_eq!(
+            guard.total_balance,
+            dec!(100) + dec!(19.40) * dec!(0.59) - fee
+        );
+        assert_eq!(guard.realized_pnl, dec!(19.40) * dec!(0.09) - fee);
     }
 
     #[tokio::test]
@@ -2224,8 +2227,8 @@ mod sell_fee_buffer_tests {
         let price = dec!(0.80);
         let slippage = dec!(0.02); // 2%
         let limit = calculate_limit_price(price, TradeSide::SELL, slippage);
-        // 0.80 - 0.80*0.02 = 0.80 - 0.016 = 0.784 → rounds to 0.78
-        assert_eq!(limit, dec!(0.78));
+        // 0.784 rounds upward to 0.79 so the SELL does not exceed 2% slippage.
+        assert_eq!(limit, dec!(0.79));
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub fn settle_paper(
     state.total_balance += proceeds;
     state.realized_pnl += pnl;
     let cycle_pnl = state.paper_cycle_pnl.remove(token).unwrap_or_default() + pnl;
+    crate::simulation::record_outcome(state, token, cycle_pnl);
     Some((proceeds, cycle_pnl))
 }
 

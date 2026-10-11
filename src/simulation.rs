@@ -10,6 +10,8 @@ struct Snapshot {
     realized_pnl: Decimal,
     #[serde(default)]
     cycle_pnl: HashMap<String, Decimal>,
+    #[serde(default)]
+    outcomes: Vec<(String, Decimal, i64)>,
 }
 pub fn restore(state: &mut BotState) -> anyhow::Result<()> {
     match std::fs::read_to_string("simulation_state.json") {
@@ -19,6 +21,8 @@ pub fn restore(state: &mut BotState) -> anyhow::Result<()> {
             state.total_balance = s.total_balance;
             state.realized_pnl = s.realized_pnl;
             state.paper_cycle_pnl = s.cycle_pnl;
+            state.paper_outcomes = s.outcomes;
+            state.paper_committed_outcomes = state.paper_outcomes.len();
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
@@ -31,10 +35,37 @@ pub fn save(state: &BotState) -> anyhow::Result<()> {
         total_balance: state.total_balance,
         realized_pnl: state.realized_pnl,
         cycle_pnl: state.paper_cycle_pnl.clone(),
+        outcomes: state.paper_outcomes.clone(),
     };
-    std::fs::write("simulation_state.json.tmp", serde_json::to_vec_pretty(&s)?)?;
+    use std::io::Write;
+    let mut file = std::fs::File::create("simulation_state.json.tmp")?;
+    file.write_all(&serde_json::to_vec_pretty(&s)?)?;
+    file.sync_all()?;
     std::fs::rename("simulation_state.json.tmp", "simulation_state.json")?;
+    #[cfg(unix)]
+    std::fs::File::open(".")?.sync_all()?;
     Ok(())
+}
+
+pub fn record_outcome(state: &mut BotState, token: &str, pnl: Decimal) {
+    let id = format!("paper:{}:{token}", state.paper_outcomes.len());
+    state
+        .paper_outcomes
+        .push((id, pnl, chrono::Utc::now().timestamp()));
+}
+
+pub fn commit(state: &mut BotState) -> anyhow::Result<()> {
+    save(state)?;
+    state.paper_committed_outcomes = state.paper_outcomes.len();
+    Ok(())
+}
+
+pub fn sync_risk(risk: &mut crate::risk::RiskEngine, state: &BotState) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        state.paper_committed_outcomes <= state.paper_outcomes.len(),
+        "Invalid paper outcome checkpoint"
+    );
+    risk.sync_live_outcomes(&state.paper_outcomes[..state.paper_committed_outcomes])
 }
 
 /// Fill a paper SELL against owned inventory. Return a risk outcome only at full exit.
@@ -62,7 +93,11 @@ pub fn sell(
     *state.paper_cycle_pnl.entry(token.into()).or_default() += pnl;
     if closed {
         state.positions.remove(token);
-        Ok(state.paper_cycle_pnl.remove(token))
+        let outcome = state.paper_cycle_pnl.remove(token);
+        if let Some(pnl) = outcome {
+            record_outcome(state, token, pnl);
+        }
+        Ok(outcome)
     } else {
         Ok(None)
     }
@@ -96,6 +131,7 @@ mod tests {
             total_balance: state.total_balance,
             realized_pnl: state.realized_pnl,
             cycle_pnl: state.paper_cycle_pnl.clone(),
+            outcomes: state.paper_outcomes.clone(),
         };
         let restored: Snapshot =
             serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
@@ -110,6 +146,8 @@ mod tests {
         assert_eq!(state.realized_pnl, d("-0.158"));
         assert!(state.positions.is_empty());
         assert!(state.paper_cycle_pnl.is_empty());
+        assert_eq!(state.paper_outcomes.len(), 1);
+        assert_eq!(state.paper_outcomes[0].1, d("-0.158"));
         assert!(sell(&mut state, "token", d("1"), d("0.7"), Decimal::ZERO).is_err());
     }
     #[test]
@@ -118,6 +156,7 @@ mod tests {
             serde_json::from_str(r#"{"positions":{},"total_balance":"200","realized_pnl":"0"}"#)
                 .unwrap();
         assert!(legacy.cycle_pnl.is_empty());
+        assert!(legacy.outcomes.is_empty());
         let mut state = BotState::new(true, Some(d("200")));
         state.positions.insert(
             "token".into(),

@@ -358,7 +358,7 @@ pub fn stored() -> anyhow::Result<Vec<Fill>> {
 }
 pub fn sync_risk(risk: &mut crate::risk::RiskEngine) -> anyhow::Result<()> {
     let book = accounted(&stored()?, &crate::execution_journal::snapshot()?)?;
-    risk.sync_live_outcomes(&book.closed_outcomes)
+    risk.sync_live_snapshot(&book.closed_outcomes)
 }
 pub fn accounted(fills: &[Fill], journal: &BTreeMap<String, Record>) -> anyhow::Result<Projection> {
     let mut book = project(fills, journal)?;

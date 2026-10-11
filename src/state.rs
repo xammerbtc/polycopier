@@ -6,6 +6,9 @@ use std::time::Instant;
 pub struct BotState {
     /// Realized exits for each still-open paper position, carried into its final risk outcome.
     pub paper_cycle_pnl: HashMap<String, Decimal>,
+    /// Completed paper cycles persisted with inventory before risk notification.
+    pub paper_outcomes: Vec<(String, Decimal, i64)>,
+    pub paper_committed_outcomes: usize,
     pub in_flight_tokens: std::collections::HashSet<String>,
     pub live_fills_ready: bool,
     pub last_live_fill_sync: i64,
@@ -66,6 +69,8 @@ impl BotState {
 
         Self {
             paper_cycle_pnl: HashMap::new(),
+            paper_outcomes: Vec::new(),
+            paper_committed_outcomes: 0,
             in_flight_tokens: std::collections::HashSet::new(),
             live_fills_ready: false,
             last_live_fill_sync: 0,

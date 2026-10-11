@@ -243,6 +243,14 @@ this copier. A real copier redemption and live fill-to-order latency remain
 unexecuted in this dry-run deployment. Protocol V3/PositionManager fills are not
 silently treated as CTF fills; unsupported settlement contracts block execution.
 
+Live risk reconciliation replays the complete finalized book in chain order
+when the book or risk limits change. A late older fill cannot be appended after
+an already observed win. Equal timestamps retain block/transaction/log order;
+duplicate, future, unordered or missing previously settled outcomes block
+execution. Expired historical cooldowns do not seed a new loss streak, and a
+failed risk write does not advance the in-memory checkpoint. The replay snapshot
+persists so an unchanged book is not charged again after restart.
+
 As root, `runtime/node24 deploy/redeemer/preflight.mjs .env.credentials` checks
 the actual official SecureClient authentication, configured deployed Safe and
 both CTF redemption adapter permissions, without sending approvals or redeeming.
@@ -260,6 +268,24 @@ without accumulated cycle PnL remain readable; historical omitted fees cannot be
 reconstructed from an old paper snapshot. Live accounting uses confirmed actual
 fees; its balance reservation uses the current highest published coefficient
 (0.07) rather than the previous underestimated 0.02 estimate.
+
+Completed paper outcomes are saved atomically and fsynced with the balance and
+positions before risk notification. Risk consumes only committed outcomes;
+restart replays any saved close whose notification was lost, with persisted IDs
+preventing a second charge. Snapshot or risk persistence failure pauses execution.
+
+The configured SELL buffer is applied to copier-owned shares before truncating
+to two decimal places. At the requested 0.97 buffer, 20.003 owned shares produce
+a 19.40-share sale and a 0.603-share residual; the ledger remains active.
+BUY limit prices round down to the supported two-decimal tick and SELL prices
+round up. The rounded price must still satisfy the exact configured slippage
+bound; impossible price bounds skip the order instead of relaxing the limit.
+
+Dispatch latency is recorded immediately before the live CLOB POST, after SDK
+order preparation/signing and durable intent. Paper mode records dispatch before
+its simulated matching delay. Preparation alone does not count as a dispatch;
+failed preparation clears its marker. Dispatch and acknowledgement expose their
+source event keys so a qualification cannot combine two concurrent signals.
 
 An isolated five-minute paper latency observation on 2026-10-11 connected to
 RTDS but received no new target-wallet trades before its runtime limit. It used

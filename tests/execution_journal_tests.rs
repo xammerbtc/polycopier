@@ -115,7 +115,7 @@ async fn exact_order_ownership_and_uncertain_startup_protect_shared_wallet() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(
         *sizes.lock().await,
-        vec![dec!(10)],
+        vec![dec!(9.70)],
         "shared wallet balance is not copier-owned inventory"
     );
     assert!(

@@ -14,12 +14,14 @@ pub struct Metrics {
     pub last_fill_to_accept_upper_bound_ms: Option<i64>,
     pub last_receive_to_accept_ms: Option<u64>,
     pub last_accept_source: Option<String>,
+    pub last_accept_event_key: Option<String>,
     pub websocket_target_events: u64,
     pub polling_target_events: u64,
     pub order_dispatches: u64,
     pub last_receive_to_dispatch_ms: Option<u64>,
     pub last_fill_to_dispatch_upper_bound_ms: Option<i64>,
     pub last_source: Option<String>,
+    pub last_dispatch_event_key: Option<String>,
     pub last_dispatch_at: Option<i64>,
     pub last_websocket_fill_age_upper_bound_ms: Option<i64>,
 }
@@ -27,6 +29,33 @@ type Observation = (Instant, &'static str);
 static METRICS: LazyLock<Mutex<Metrics>> = LazyLock::new(|| Mutex::new(Metrics::default()));
 static RECEIVED: LazyLock<Mutex<HashMap<String, Observation>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static PREPARED: LazyLock<Mutex<HashMap<String, (TradeEvent, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn prepare(event: &TradeEvent) {
+    let mut pending = PREPARED.lock().unwrap();
+    pending.retain(|_, (_, at)| at.elapsed().as_secs() < 60);
+    if pending.len() >= 20000 {
+        pending.clear();
+    }
+    pending.insert(event.token_id.clone(), (event.clone(), Instant::now()));
+}
+pub fn clear_prepared(token: &str) {
+    PREPARED.lock().unwrap().remove(token);
+}
+
+/// Called after signing and durable intent, immediately before CLOB POST
+/// (or before the paper submitter's simulated matching delay).
+pub fn dispatch_token(token: &str) {
+    let event = PREPARED
+        .lock()
+        .unwrap()
+        .remove(token)
+        .map(|(event, _)| event);
+    if let Some(event) = event {
+        dispatch(&event);
+    }
+}
 
 pub fn receive(event: &TradeEvent, source: &'static str) {
     let mut metrics = METRICS.lock().unwrap();
@@ -58,6 +87,7 @@ pub fn dispatch(event: &TradeEvent) {
     metrics.last_receive_to_dispatch_ms =
         observation.map(|(when, _)| when.elapsed().as_millis() as u64);
     metrics.last_source = observation.map(|(_, source)| source.to_string());
+    metrics.last_dispatch_event_key = observation.map(|_| crate::rtds::event_key(event));
     metrics.last_fill_to_dispatch_upper_bound_ms = observation
         .map(|_| chrono::Utc::now().timestamp_millis() - event.timestamp.saturating_mul(1000));
     metrics.last_dispatch_at = Some(chrono::Utc::now().timestamp_millis());
@@ -76,6 +106,7 @@ pub fn accepted(event: &TradeEvent) {
     let mut metrics = METRICS.lock().unwrap();
     metrics.order_acceptances += 1;
     metrics.last_accept_source = observation.map(|(_, source)| source.into());
+    metrics.last_accept_event_key = observation.map(|_| crate::rtds::event_key(event));
     metrics.last_receive_to_accept_ms =
         observation.map(|(when, _)| when.elapsed().as_millis() as u64);
     metrics.last_fill_to_accept_upper_bound_ms = observation
@@ -107,12 +138,24 @@ mod tests {
         accepted(&event);
         assert_eq!(snapshot().last_fill_to_accept_upper_bound_ms, None);
         receive(&event, "websocket");
-        dispatch(&event);
+        let before = snapshot().order_dispatches;
+        prepare(&event);
+        assert_eq!(snapshot().order_dispatches, before);
+        dispatch_token(&event.token_id);
+        assert_eq!(snapshot().order_dispatches, before + 1);
         assert_eq!(snapshot().last_source.as_deref(), Some("websocket"));
         assert!(snapshot().last_fill_to_dispatch_upper_bound_ms.is_some());
         assert!(snapshot().last_receive_to_dispatch_ms.is_some());
         accepted(&event);
         assert_eq!(snapshot().last_accept_source.as_deref(), Some("websocket"));
         assert!(snapshot().last_fill_to_accept_upper_bound_ms.is_some());
+        assert_eq!(
+            snapshot().last_dispatch_event_key,
+            snapshot().last_accept_event_key
+        );
+        prepare(&event);
+        clear_prepared(&event.token_id);
+        dispatch_token(&event.token_id);
+        assert_eq!(snapshot().order_dispatches, before + 1);
     }
 }

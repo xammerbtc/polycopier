@@ -17,6 +17,8 @@ use std::time::Instant;
 
 #[derive(Clone)]
 pub struct RiskEngine {
+    live_outcome_snapshot: Option<Vec<(String, Decimal, i64)>>,
+    live_snapshot_limits: Option<(u32, u64)>,
     seen_live_outcomes: std::collections::BTreeSet<String>,
     config: Config,
 
@@ -54,7 +56,7 @@ impl RiskEngine {
             chrono::Utc::now().timestamp()
                 + t.saturating_duration_since(Instant::now()).as_secs() as i64
         });
-        let raw = serde_json::json!({"date":self.daily_reset_date,"volume":self.daily_volume_usd,"losses":self.consecutive_losses,"cooldown_until":until,"seen_live_outcomes":self.seen_live_outcomes});
+        let raw = serde_json::json!({"date":self.daily_reset_date,"volume":self.daily_volume_usd,"losses":self.consecutive_losses,"cooldown_until":until,"seen_live_outcomes":self.seen_live_outcomes,"live_outcome_snapshot":self.live_outcome_snapshot,"live_snapshot_limits":self.live_snapshot_limits});
         let mut file = std::fs::File::create(format!("{path}.tmp"))?;
         file.write_all(raw.to_string().as_bytes())?;
         file.sync_all()?;
@@ -80,6 +82,16 @@ impl RiskEngine {
             Err(e) => return Err(e.into()),
         };
         let v: serde_json::Value = serde_json::from_str(&raw)?;
+        self.live_outcome_snapshot = v
+            .get("live_outcome_snapshot")
+            .map(|s| serde_json::from_value(s.clone()))
+            .transpose()?
+            .flatten();
+        self.live_snapshot_limits = v
+            .get("live_snapshot_limits")
+            .map(|s| serde_json::from_value(s.clone()))
+            .transpose()?
+            .flatten();
         if let Some(ids) = v.get("seen_live_outcomes") {
             self.seen_live_outcomes = serde_json::from_value(ids.clone())?;
         }
@@ -145,6 +157,8 @@ impl RiskEngine {
     }
     pub fn new(config: Config) -> Self {
         Self {
+            live_outcome_snapshot: None,
+            live_snapshot_limits: None,
             seen_live_outcomes: std::collections::BTreeSet::new(),
             config,
             daily_volume_usd: Decimal::ZERO,
@@ -272,6 +286,78 @@ impl RiskEngine {
             );
         }
     }
+    /// Rebuild from the complete, chain-ordered live book. Late finalization may
+    /// insert an older outcome before a win we have already observed.
+    pub fn sync_live_snapshot(
+        &mut self,
+        outcomes: &[(String, Decimal, i64)],
+    ) -> anyhow::Result<()> {
+        let now = chrono::Utc::now();
+        let limits = (
+            self.config.max_consecutive_losses,
+            self.config.loss_cooldown_secs,
+        );
+        if self.daily_reset_date == now.date_naive()
+            && self.live_outcome_snapshot.as_deref() == Some(outcomes)
+            && self.live_snapshot_limits == Some(limits)
+        {
+            return Ok(());
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        let mut previous = i64::MIN;
+        let mut losses: u32 = 0;
+        let mut until: Option<i64> = None;
+        for (id, pnl, timestamp) in outcomes {
+            anyhow::ensure!(
+                ids.insert(id.clone()) && *timestamp >= previous && *timestamp <= now.timestamp(),
+                "Invalid or unordered outcome snapshot"
+            );
+            previous = *timestamp;
+            let at = chrono::DateTime::from_timestamp(*timestamp, 0)
+                .ok_or_else(|| anyhow::anyhow!("Invalid realized outcome timestamp"))?;
+            if at.date_naive() != now.date_naive() {
+                continue;
+            }
+            if until.is_some_and(|end| end <= *timestamp) {
+                losses = 0;
+                until = None;
+            }
+            if *pnl < Decimal::ZERO && limits.0 > 0 {
+                losses = losses.saturating_add(1);
+                if losses >= limits.0 {
+                    until = Some(timestamp.saturating_add(limits.1 as i64));
+                }
+            } else if *pnl > Decimal::ZERO {
+                losses = 0;
+            }
+        }
+        if let Some(previous) = &self.live_outcome_snapshot {
+            anyhow::ensure!(
+                previous.iter().all(|(id, _, _)| ids.contains(id)),
+                "Live outcome snapshot lost a settled trade"
+            );
+        }
+        if until.is_some_and(|end| end <= now.timestamp()) {
+            losses = 0;
+            until = None;
+        }
+        let mut next = self.clone();
+        if next.daily_reset_date != now.date_naive() {
+            next.daily_volume_usd = Decimal::ZERO;
+        }
+        next.daily_reset_date = now.date_naive();
+        next.consecutive_losses = losses;
+        next.cooldown_until = until.map(|end| {
+            Instant::now() + std::time::Duration::from_secs((end - now.timestamp()) as u64)
+        });
+        next.seen_live_outcomes.extend(ids);
+        next.live_outcome_snapshot = Some(outcomes.to_vec());
+        next.live_snapshot_limits = Some(limits);
+        next.persist_result()?;
+        *self = next;
+        Ok(())
+    }
+
     pub fn sync_live_outcomes(
         &mut self,
         outcomes: &[(String, Decimal, i64)],

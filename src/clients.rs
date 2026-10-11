@@ -102,7 +102,7 @@ pub async fn build_order_submitter(
 
             let signed_order = clob.sign(&signer, order_req).await?;
             let intent = crate::execution_journal::begin_contextual(&order)?;
-
+            crate::latency::dispatch_token(&order.token_id);
             match clob.post_order(signed_order).await {
                 Ok(res) => {
                     // The CLOB returns HTTP 200 even for rejected orders.
@@ -176,6 +176,7 @@ pub async fn build_sim_order_submitter(
 
     let order_submitter: OrderSubmitter = Arc::new(|order: OrderRequest| {
         Box::pin(async move {
+            crate::latency::dispatch_token(&order.token_id);
             tracing::warn!(
                 "[SIMULATION] Paper-filling Limit Order: Side={:?}, Price={}, Size={}, Token={}",
                 order.side,

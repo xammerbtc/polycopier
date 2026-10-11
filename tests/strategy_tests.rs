@@ -41,3 +41,32 @@ fn zero_slippage_keeps_price_unchanged() {
     let result = calculate_limit_price(price, TradeSide::BUY, dec!(0));
     assert_eq!(result, price);
 }
+
+#[test]
+fn safe_profile_slippage_is_a_hard_bound_after_tick_rounding() {
+    for mills in 30..=970 {
+        let source = rust_decimal::Decimal::new(mills, 3);
+        for slippage in [dec!(0), dec!(0.015), dec!(0.02)] {
+            let buy = calculate_limit_price(source, TradeSide::BUY, slippage);
+            let sell = calculate_limit_price(source, TradeSide::SELL, slippage);
+            assert!(
+                buy <= source * (dec!(1) + slippage),
+                "BUY price exceeded configured slippage for {source}"
+            );
+            assert!(
+                sell >= source * (dec!(1) - slippage),
+                "SELL price exceeded configured slippage for {source}"
+            );
+            assert_eq!(buy, buy.round_dp(2));
+            assert_eq!(sell, sell.round_dp(2));
+        }
+    }
+    assert_eq!(
+        calculate_limit_price(dec!(0.65), TradeSide::BUY, dec!(0.015)),
+        dec!(0.65)
+    );
+    assert_eq!(
+        calculate_limit_price(dec!(0.80), TradeSide::SELL, dec!(0.02)),
+        dec!(0.79)
+    );
+}

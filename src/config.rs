@@ -63,7 +63,7 @@ pub struct ExecutionConfig {
     pub max_trade_size_usd: Decimal,
     /// Discard listener events older than this many seconds (staleness filter).
     pub max_delay_seconds: i64,
-    /// SELL size = held_size × sell_fee_buffer. Absorbs CLOB fee. Default 0.97.
+    /// SELL size = owned_size × sell_fee_buffer. Retains the remainder. Default 0.97.
     pub sell_fee_buffer: Decimal,
     /// Skip entries and cancel pending orders for markets that close within this many minutes.
     pub ignore_closing_in_mins: Option<u64>,
@@ -274,7 +274,7 @@ max_slippage_pct = {slippage}
 max_trade_size_usd = {max_trade}
 # Drop listener events older than N seconds (staleness filter)
 max_delay_seconds = {delay}
-# SELL size = held_size x sell_fee_buffer (absorbs CLOB fee, default 0.97)
+# SELL size = owned_size x sell_fee_buffer (retains remainder, default 0.97)
 sell_fee_buffer = {fee_buf}
 # Skip markets closing in less than X minutes (e.g. 15)
 {ignore_closing}

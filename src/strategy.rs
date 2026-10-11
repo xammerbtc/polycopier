@@ -29,8 +29,12 @@ pub fn calculate_limit_price(price: Decimal, side: TradeSide, slippage_pct: Deci
     let max_price = Decimal::new(99, 2); // 0.99
     let min_price = Decimal::new(1, 2); // 0.01
     match side {
-        TradeSide::BUY => (price + price * slippage_pct).round_dp(2).min(max_price),
-        TradeSide::SELL => (price - price * slippage_pct).round_dp(2).max(min_price),
+        TradeSide::BUY => (price + price * slippage_pct)
+            .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToNegativeInfinity)
+            .clamp(min_price, max_price),
+        TradeSide::SELL => (price - price * slippage_pct)
+            .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToPositiveInfinity)
+            .clamp(min_price, max_price),
     }
 }
 
@@ -346,6 +350,25 @@ impl EndDateCache {
     }
 }
 
+async fn reconcile_risk(risk: &mut RiskEngine, state: &Arc<RwLock<BotState>>, is_sim: bool) {
+    let result = if is_sim {
+        crate::simulation::sync_risk(risk, &*state.read().await)
+    } else if crate::execution_journal::active() {
+        crate::live_fills::sync_risk(risk)
+    } else {
+        Ok(())
+    };
+    if let Err(e) = result {
+        let mut guard = state.write().await;
+        if is_sim {
+            guard.started = true;
+        } else {
+            guard.live_fills_ready = false;
+        }
+        tracing::error!("Risk reconciliation failed; execution blocked: {e}");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn start_strategy_engine(
     rx: mpsc::Receiver<TradeEvent>,
@@ -399,21 +422,21 @@ pub fn start_strategy_engine_with_fees(
             let event = tokio::select! {
                 biased;
                 _ = risk_tick.tick() => {
-                    if crate::execution_journal::active() && crate::live_fills::sync_risk(&mut risk_engine).is_err() {
-                        state.write().await.live_fills_ready = false;
-                        tracing::error!("Live risk reconciliation failed; execution blocked");
-                    }
+                    reconcile_risk(&mut risk_engine, &state, config.is_sim).await;
                     continue;
                 }
                 Some(pnl) = outcome_rx.recv() => {
-                    if pnl < Decimal::ZERO { risk_engine.record_loss(); }
+                    if config.is_sim { reconcile_risk(&mut risk_engine, &state, true).await; }
+                    else if pnl < Decimal::ZERO { risk_engine.record_loss(); }
                     else if pnl > Decimal::ZERO { risk_engine.record_win(); }
                     continue;
                 }
                 event = rx.recv() => match event { Some(event) => event, None => break },
             };
             while let Ok(pnl) = outcome_rx.try_recv() {
-                if pnl < Decimal::ZERO {
+                if config.is_sim {
+                    reconcile_risk(&mut risk_engine, &state, true).await;
+                } else if pnl < Decimal::ZERO {
                     risk_engine.record_loss();
                 } else if pnl > Decimal::ZERO {
                     risk_engine.record_win();
@@ -421,11 +444,7 @@ pub fn start_strategy_engine_with_fees(
             }
             config.hot_reload();
             risk_engine.update_config(config.clone());
-            if crate::execution_journal::active()
-                && crate::live_fills::sync_risk(&mut risk_engine).is_err()
-            {
-                state.write().await.live_fills_ready = false;
-            }
+            reconcile_risk(&mut risk_engine, &state, config.is_sim).await;
             event_count += 1;
             // Evict expired live-query cache entries every 50 events (Gap 13)
             if event_count.is_multiple_of(50) {
@@ -746,11 +765,27 @@ pub fn start_strategy_engine_with_fees(
                 // Determine limit price: rounded to 2dp (CLOB tick), capped to [0.01, 0.99]
                 let limit_price =
                     calculate_limit_price(event.price, event.side, config.max_slippage_pct);
+                let allowed = match event.side {
+                    TradeSide::BUY => {
+                        limit_price <= event.price * (Decimal::ONE + config.max_slippage_pct)
+                    }
+                    TradeSide::SELL => {
+                        limit_price >= event.price * (Decimal::ONE - config.max_slippage_pct)
+                    }
+                };
+                if !allowed {
+                    state.write().await.push_evaluated_trade(EvaluatedTrade {
+                        original_event: event.clone(),
+                        validated: false,
+                        reason: Some("No valid limit price within configured slippage".into()),
+                    });
+                    continue;
+                }
 
                 let order: Option<(OrderRequest, Decimal)> = if is_closing {
-                    // -- SELL: close our position using our 100% held size --
-                    // (Polymarket handles the CTF fee by deducting from the USDC payout,
-                    // we no longer reduce the share count to avoid "dust" shares).
+                    // Apply the configured inventory buffer to our owned shares.
+                    // Fees still come out of sale proceeds; residual shares stay
+                    // active in the ledger until a later exit or redemption.
                     let our_held_size = {
                         let guard = state.read().await;
                         guard
@@ -771,7 +806,8 @@ pub fn start_strategy_engine_with_fees(
                     } else {
                         our_held_size
                     };
-                    let truncated_size = our_held_size.trunc_with_scale(2);
+                    let truncated_size =
+                        (our_held_size * config.sell_fee_buffer).trunc_with_scale(2);
                     if truncated_size <= rust_decimal::Decimal::ZERO {
                         let msg = format!("Dust fractional balance {:.4} truncates to 0.00 — skipping limit order logic.", our_held_size);
                         tracing::warn!("{}", msg);
@@ -968,8 +1004,9 @@ pub fn start_strategy_engine_with_fees(
                                 &source_wallet_clone,
                             );
                         }
-                        crate::latency::dispatch(&latency_event);
+                        crate::latency::prepare(&latency_event);
                         let submitted = submitter_clone(order).await;
+                        crate::latency::clear_prepared(&token_id_clone);
                         crate::execution_journal::clear_source(&token_id_clone);
                         match submitted {
                             Ok(()) => {
@@ -1044,8 +1081,9 @@ pub fn start_strategy_engine_with_fees(
                                         })
                                         .sum();
                                     let saved = if ledger.is_persistent() {
-                                        crate::simulation::save(&guard)
+                                        crate::simulation::commit(&mut guard)
                                     } else {
+                                        guard.paper_committed_outcomes = guard.paper_outcomes.len();
                                         Ok(())
                                     };
                                     if let Err(e) = saved {
