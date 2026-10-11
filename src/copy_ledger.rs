@@ -93,6 +93,9 @@ impl Default for CopyLedger {
 // ---------------------------------------------------------------------------
 
 impl CopyLedger {
+    pub fn is_persistent(&self) -> bool {
+        !self.path.is_empty()
+    }
     // -- Constructors -------------------------------------------------------
 
     /// Load from `copy_ledger.json`, or start an empty ledger if the file

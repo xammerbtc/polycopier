@@ -1569,6 +1569,54 @@ mod strategy_engine_tests {
     }
 
     #[tokio::test]
+    async fn paper_buy_carries_current_fee_into_position_and_ledger_basis() {
+        let mut config = test_config();
+        config.is_sim = true;
+        let state = Arc::new(RwLock::new(BotState::new(true, Some(dec!(200)))));
+        let ledger = test_ledger();
+        let log = Arc::new(Mutex::new(vec![]));
+        let (tx, rx) = mpsc::channel(10);
+        polycopier::strategy::start_strategy_engine_with_fees(
+            rx,
+            state.clone(),
+            RiskEngine::new(config.clone()),
+            mock_submitter(log.clone()),
+            config,
+            ledger.clone(),
+            make_no_op_holds_query(),
+            make_no_op_end_date_query(),
+            Arc::new(|_| Box::pin(async { Ok(dec!(0.07)) })),
+        );
+        tx.send(make_trade("0xabc", dec!(0.50), dec!(10), TradeSide::BUY))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while state.read().await.positions.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let order = log.lock().unwrap()[0].clone();
+        let fee = polycopier::fees::taker_fee(order.size, order.price, dec!(0.07));
+        let cost = order.size * order.price + fee;
+        let guard = state.read().await;
+        assert_eq!(guard.total_balance, dec!(200) - cost);
+        let basis = cost / order.size;
+        assert_eq!(guard.positions["99999"].average_entry_price, basis);
+        assert_eq!(
+            ledger
+                .lock()
+                .await
+                .find_active_for_token("99999")
+                .unwrap()
+                .entry_price,
+            basis
+        );
+        assert_eq!(guard.realized_pnl, Decimal::ZERO);
+    }
+
+    #[tokio::test]
     async fn paper_sell_preserves_fractional_residual_and_accounts_sell_fee() {
         let mut config = test_config();
         config.is_sim = true;
@@ -1589,15 +1637,16 @@ mod strategy_engine_tests {
         }));
         let log = Arc::new(Mutex::new(vec![]));
         let (tx, rx) = mpsc::channel(10);
-        start_strategy_engine(
+        polycopier::strategy::start_strategy_engine_with_fees(
             rx,
             state.clone(),
             RiskEngine::new(config.clone()),
             mock_submitter(log.clone()),
             config,
-            ledger,
+            ledger.clone(),
             make_no_op_holds_query(),
             make_no_op_end_date_query(),
+            Arc::new(|_| Box::pin(async { Ok(dec!(0.02)) })),
         );
         tx.send(make_trade("0xabc", dec!(0.60), dec!(30), TradeSide::SELL))
             .await
@@ -1614,7 +1663,16 @@ mod strategy_engine_tests {
         .unwrap();
         let guard = state.read().await;
         assert_eq!(guard.positions["99999"].size, dec!(0.003));
-        let fee = dec!(20) * dec!(0.02) * dec!(0.59) * dec!(0.41);
+        assert_eq!(
+            ledger
+                .lock()
+                .await
+                .find_active_for_token("99999")
+                .unwrap()
+                .filled_size,
+            Some(dec!(0.003))
+        );
+        let fee = (dec!(20) * dec!(0.02) * dec!(0.59) * dec!(0.41)).round_dp(5);
         assert_eq!(guard.total_balance, dec!(100) + dec!(20) * dec!(0.59) - fee);
         assert_eq!(guard.realized_pnl, dec!(20) * dec!(0.09) - fee);
     }

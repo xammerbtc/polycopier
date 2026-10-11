@@ -348,6 +348,30 @@ impl EndDateCache {
 
 #[allow(clippy::too_many_arguments)]
 pub fn start_strategy_engine(
+    rx: mpsc::Receiver<TradeEvent>,
+    state: Arc<RwLock<BotState>>,
+    risk_engine: RiskEngine,
+    submitter: OrderSubmitter,
+    config: Config,
+    copy_ledger: Arc<Mutex<CopyLedger>>,
+    holds_query: HoldsQuery,
+    end_date_query: EndDateQuery,
+) {
+    start_strategy_engine_with_fees(
+        rx,
+        state,
+        risk_engine,
+        submitter,
+        config,
+        copy_ledger,
+        holds_query,
+        end_date_query,
+        crate::fees::public_query(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn start_strategy_engine_with_fees(
     mut rx: mpsc::Receiver<TradeEvent>,
     state: Arc<RwLock<BotState>>,
     mut risk_engine: RiskEngine,
@@ -356,6 +380,7 @@ pub fn start_strategy_engine(
     copy_ledger: Arc<Mutex<CopyLedger>>,
     holds_query: HoldsQuery,
     end_date_query: EndDateQuery,
+    fee_query: crate::fees::FeeQuery,
 ) {
     tokio::spawn(async move {
         info!("Strategy Engine Started. Monitoring edge cases (debouncing, closures...)");
@@ -363,6 +388,7 @@ pub fn start_strategy_engine(
         let mut debounce = DebounceCache::new();
         let mut live_cache = LiveQueryCache::new();
         let mut end_date_cache = EndDateCache::new();
+        let mut fee_cache: HashMap<String, (Decimal, Instant)> = HashMap::new();
         // Periodic cache maintenance counter
         let mut event_count: u32 = 0;
         let (outcome_tx, mut outcome_rx) = mpsc::unbounded_channel::<Decimal>();
@@ -684,6 +710,37 @@ pub fn start_strategy_engine(
             if eval.validated {
                 info!("Trade Validated: {:?}", eval.original_event);
 
+                let fee_rate = if config.is_sim {
+                    if let Some((rate, _)) = fee_cache
+                        .get(&event.token_id)
+                        .filter(|(_, at)| at.elapsed().as_secs() < 60)
+                    {
+                        *rate
+                    } else {
+                        match fee_query(event.token_id.clone()).await {
+                            Ok(rate) => {
+                                if fee_cache.len() >= 20000 {
+                                    fee_cache.clear();
+                                }
+                                fee_cache.insert(event.token_id.clone(), (rate, Instant::now()));
+                                rate
+                            }
+                            Err(e) => {
+                                state.write().await.push_evaluated_trade(EvaluatedTrade {
+                                    original_event: event.clone(),
+                                    validated: false,
+                                    reason: Some(format!("Paper fee schedule unavailable: {e}")),
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                } else {
+                    // Live accounting uses actual finalized fees. Reserve the current
+                    // highest published taker coefficient until the receipt arrives.
+                    Decimal::new(7, 2)
+                };
+
                 let is_closing = event.side == TradeSide::SELL;
 
                 // Determine limit price: rounded to 2dp (CLOB tick), capped to [0.01, 0.99]
@@ -785,10 +842,9 @@ pub fn start_strategy_engine(
                         None
                     } else {
                         // Pre-check balance taking the maximum CTF fee overhead into account
-                        // fee = C * feeRate * p * (1 - p). We assume a max 200bps (0.02) feeRate to be safe.
+                        // Reserve paper's current market fee / conservative live overhead.
                         let p = limit_price;
-                        let max_ctf_fee =
-                            buy_size * Decimal::from_str("0.02").unwrap() * p * (Decimal::ONE - p);
+                        let max_ctf_fee = crate::fees::taker_fee(buy_size, p, fee_rate);
                         let order_cost = buy_size * limit_price;
                         let total_cost = order_cost + max_ctf_fee;
 
@@ -919,7 +975,88 @@ pub fn start_strategy_engine(
                             Ok(()) => {
                                 crate::latency::accepted(&latency_event);
                                 let mut ledger = ledger_clone.lock().await;
-                                if is_closing && !is_sim && crate::execution_journal::active() {
+                                if is_sim {
+                                    let mut guard = state_clone.write().await;
+                                    let mut closed_outcome = None;
+                                    if is_closing {
+                                        let fee = crate::fees::taker_fee(
+                                            order_size,
+                                            order_price,
+                                            fee_rate,
+                                        );
+                                        match crate::simulation::sell(
+                                            &mut guard,
+                                            &token_id_clone,
+                                            order_size,
+                                            order_price,
+                                            fee,
+                                        ) {
+                                            Ok(outcome) => {
+                                                if let Some(pnl) = outcome {
+                                                    ledger.record_close(
+                                                        &token_id_clone,
+                                                        &source_wallet_clone,
+                                                    );
+                                                    closed_outcome = Some(pnl);
+                                                } else if let Some(position) =
+                                                    guard.positions.get(&token_id_clone)
+                                                {
+                                                    ledger.update_fill(
+                                                        &token_id_clone,
+                                                        position.size,
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                guard.started = true;
+                                                tracing::error!("Paper fill accounting failed; execution paused: {e}");
+                                            }
+                                        }
+                                    } else {
+                                        // The reservation includes the BUY fee; carry that full
+                                        // basis through later partial exits and redemption.
+                                        let average_entry_price = cost_to_deduct / order_size;
+                                        guard.positions.insert(
+                                            token_id_clone.clone(),
+                                            crate::models::Position {
+                                                token_id: token_id_clone.clone(),
+                                                size: order_size,
+                                                average_entry_price,
+                                            },
+                                        );
+                                        guard.paper_cycle_pnl.remove(&token_id_clone);
+                                        ledger.record_copy(
+                                            token_id_clone.clone(),
+                                            source_wallet_clone.clone(),
+                                            order_size,
+                                            average_entry_price,
+                                        );
+                                        ledger.update_fill(&token_id_clone, order_size);
+                                    }
+                                    guard.pending_orders.remove(&token_id_clone);
+                                    guard.unrealized_pnl = guard
+                                        .positions
+                                        .values()
+                                        .filter_map(|p| {
+                                            guard.position_prices.get(&p.token_id).map(|price| {
+                                                (*price - p.average_entry_price) * p.size
+                                            })
+                                        })
+                                        .sum();
+                                    let saved = if ledger.is_persistent() {
+                                        crate::simulation::save(&guard)
+                                    } else {
+                                        Ok(())
+                                    };
+                                    if let Err(e) = saved {
+                                        guard.started = true;
+                                        tracing::error!(
+                                            "Paper fill persistence failed; execution paused: {e}"
+                                        );
+                                    } else if let Some(pnl) = closed_outcome {
+                                        let _ = outcome_tx.send(pnl);
+                                    }
+                                } else if is_closing && crate::execution_journal::active() {
                                     info!("Live SELL accepted; ledger and realized PnL await confirmed fills");
                                 } else if is_closing {
                                     ledger.record_close(&token_id_clone, &source_wallet_clone);
@@ -931,17 +1068,7 @@ pub fn start_strategy_engine(
                                     // Accumulate realized PnL
                                     if let Some(avg_entry) = entry_price {
                                         let pnl = (order_price - avg_entry) * order_size;
-                                        let fee = if is_sim {
-                                            order_size
-                                                * Decimal::new(2, 2)
-                                                * order_price
-                                                * (Decimal::ONE - order_price)
-                                        } else {
-                                            Decimal::ZERO
-                                        };
-                                        if is_sim {
-                                            let _ = outcome_tx.send(pnl - fee);
-                                        }
+                                        let fee = Decimal::ZERO;
                                         let mut guard = state_clone.write().await;
                                         guard.realized_pnl += pnl - fee;
                                         // Subtract this token's contribution from unrealized;
@@ -965,43 +1092,6 @@ pub fn start_strategy_engine(
                                         &token_id_clone[..token_id_clone.len().min(12)],
                                         &source_wallet_clone[..source_wallet_clone.len().min(10)],
                                     );
-                                }
-
-                                if is_sim {
-                                    let mut guard = state_clone.write().await;
-                                    let fee_rate = rust_decimal::Decimal::from_str("0.02").unwrap();
-                                    let max_ctf_fee = order_size
-                                        * fee_rate
-                                        * order_price
-                                        * (rust_decimal::Decimal::ONE - order_price);
-
-                                    if is_closing {
-                                        if let Some(position) =
-                                            guard.positions.get_mut(&token_id_clone)
-                                        {
-                                            position.size =
-                                                (position.size - order_size).max(Decimal::ZERO);
-                                            if position.size == Decimal::ZERO {
-                                                guard.positions.remove(&token_id_clone);
-                                            }
-                                        }
-                                        guard.total_balance +=
-                                            (order_size * order_price) - max_ctf_fee;
-                                    } else {
-                                        // Auto-fill mock position
-                                        guard.positions.insert(
-                                            token_id_clone.clone(),
-                                            crate::models::Position {
-                                                token_id: token_id_clone.clone(),
-                                                size: order_size,
-                                                average_entry_price: order_price,
-                                            },
-                                        );
-                                        // We purposefully do NOT deduct the cost here!
-                                        // It was already eagerly deducted right before `tokio::spawn`!
-                                    }
-                                    // Remove from pending logic to match real world
-                                    guard.pending_orders.remove(&token_id_clone);
                                 }
                             }
                             Err(e) => {

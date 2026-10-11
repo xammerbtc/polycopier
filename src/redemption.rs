@@ -15,7 +15,8 @@ pub fn settle_paper(
     let pnl = proceeds - position.size * position.average_entry_price;
     state.total_balance += proceeds;
     state.realized_pnl += pnl;
-    Some((proceeds, pnl))
+    let cycle_pnl = state.paper_cycle_pnl.remove(token).unwrap_or_default() + pnl;
+    Some((proceeds, cycle_pnl))
 }
 
 pub fn payout(market: &Value, token: &str) -> Option<Decimal> {
@@ -79,6 +80,37 @@ pub async fn resolved_payout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn redeem_remaining_shares_reports_one_combined_cycle_without_double_credit() {
+        let mut state = crate::state::BotState::new(true, Some(Decimal::from(194)));
+        state.positions.insert(
+            "yes".into(),
+            crate::models::Position {
+                token_id: "yes".into(),
+                size: Decimal::from(10),
+                average_entry_price: Decimal::new(6, 1),
+            },
+        );
+        assert_eq!(
+            crate::simulation::sell(
+                &mut state,
+                "yes",
+                Decimal::from(9),
+                Decimal::new(5, 1),
+                Decimal::ZERO
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            settle_paper(&mut state, "yes", Decimal::ONE),
+            Some((Decimal::ONE, Decimal::new(-5, 1)))
+        );
+        assert_eq!(state.realized_pnl, Decimal::new(-5, 1));
+        assert_eq!(state.total_balance, Decimal::new(1995, 1));
+        assert!(state.paper_cycle_pnl.is_empty());
+        assert_eq!(settle_paper(&mut state, "yes", Decimal::ONE), None);
+    }
     #[test]
     fn paper_settlement_credits_once_and_realizes_winner_and_loser() {
         use crate::{models::Position, state::BotState};

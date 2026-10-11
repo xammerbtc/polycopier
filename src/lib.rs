@@ -6,6 +6,7 @@ pub mod config;
 pub mod copied_counter;
 pub mod copy_ledger;
 pub mod execution_journal;
+pub mod fees;
 pub mod latency;
 pub mod listener;
 pub mod live_fills;

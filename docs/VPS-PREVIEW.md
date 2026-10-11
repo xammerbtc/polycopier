@@ -247,3 +247,21 @@ As root, `runtime/node24 deploy/redeemer/preflight.mjs .env.credentials` checks
 the actual official SecureClient authentication, configured deployed Safe and
 both CTF redemption adapter permissions, without sending approvals or redeeming.
 The deployed Safe passed this check on 2026-10-11; both permissions were present.
+
+Paper fills read the exact CTF market's `feesEnabled` and `feeSchedule` from
+Gamma (60-second cache), apply the documented taker curve with five-decimal
+rounding, and reject missing or unsupported fee schedules. They model instant
+taker fills at the limit price; they do not claim real GTC matching or maker
+rebates. BUY fees enter the held position's cost basis. Partial SELLs preserve
+the ledger and remaining shares, realize only the sold slice, and persist the
+cycle's accumulated PnL. The loss streak receives one combined outcome on full
+exit or redemption, including partial exits before a restart. Existing snapshots
+without accumulated cycle PnL remain readable; historical omitted fees cannot be
+reconstructed from an old paper snapshot. Live accounting uses confirmed actual
+fees; its balance reservation uses the current highest published coefficient
+(0.07) rather than the previous underestimated 0.02 estimate.
+
+An isolated five-minute paper latency observation on 2026-10-11 connected to
+RTDS but received no new target-wallet trades before its runtime limit. It used
+closing=0 and catch-up disabled, had no trading credentials, and did not change
+the deployed closing=20 profile. It provides no qualifying fill-to-order sample.

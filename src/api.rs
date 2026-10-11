@@ -197,6 +197,7 @@ async fn redeem(State(api): State<ApiState>) -> Response {
     let old_positions = state.positions.clone();
     let old_balance = state.total_balance;
     let old_pnl = state.realized_pnl;
+    let old_cycle_pnl = state.paper_cycle_pnl.clone();
     let mut settled = Vec::new();
     for (token, payout) in resolved {
         if let Some((proceeds, pnl)) = crate::redemption::settle_paper(&mut state, &token, payout) {
@@ -207,6 +208,7 @@ async fn redeem(State(api): State<ApiState>) -> Response {
         state.positions = old_positions;
         state.total_balance = old_balance;
         state.realized_pnl = old_pnl;
+        state.paper_cycle_pnl = old_cycle_pnl;
         tracing::error!("Paper redemption persistence failed: {e}");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
