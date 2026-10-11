@@ -9,10 +9,17 @@ function App() {
   const [setupRequired, setSetupRequired] = useState(false);
 
   useEffect(() => {
+    let inFlight = false;
+    let disposed = false;
+    const controller = new AbortController();
     const fetchState = async () => {
+      if (inFlight || disposed) return;
+      inFlight = true;
       try {
-        const res = await fetch('/api/state');
+        const res = await fetch('/api/state', {signal:controller.signal});
+        if (!res.ok) throw new Error(`State request failed (${res.status})`);
         const data = await res.json();
+        if (disposed) return;
         if (data.status === 'setup_required') {
           setSetupRequired(true);
         } else {
@@ -20,14 +27,16 @@ function App() {
           setState(data);
         }
       } catch (err) {
-        console.error('Failed to fetch state', err);
+        if (!disposed) console.error('Failed to fetch state', err);
+      } finally {
+        inFlight = false;
       }
     };
     
     fetchState();
-    const interval = setInterval(fetchState, 1000);
-    return () => clearInterval(interval);
-  }, []);
+    const interval = activeTab === 'dashboard' ? setInterval(fetchState, 2000) : undefined;
+    return () => { disposed = true; controller.abort(); clearInterval(interval); };
+  }, [activeTab]);
 
   if (setupRequired) {
     return <SetupWizard />;
