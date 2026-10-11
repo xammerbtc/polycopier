@@ -19,6 +19,8 @@ pub struct Fill {
     pub transaction_hash: String,
     pub block_hash: String,
     pub block_number: u64,
+    #[serde(default)]
+    pub block_timestamp: i64,
     pub transaction_index: u64,
     pub log_index: u64,
     pub order_id: String,
@@ -96,6 +98,12 @@ pub async fn finalized_receipt(
             && hash(&header["hash"])? == hash(&receipt["blockHash"])?,
         "Receipt is not in the canonical finalized chain"
     );
+    let mut receipt = receipt;
+    anyhow::ensure!(
+        hex_number(&header["timestamp"])? > 0,
+        "Invalid finalized block timestamp"
+    );
+    receipt["blockTimestamp"] = header["timestamp"].clone();
     Ok(Some(receipt))
 }
 
@@ -219,6 +227,13 @@ pub fn decode_receipt(
         );
         let log_index = hex_number(&log["logIndex"])?;
         let fill = Fill {
+            block_timestamp: i64::try_from(
+                receipt
+                    .get("blockTimestamp")
+                    .map(hex_number)
+                    .transpose()?
+                    .unwrap_or(0),
+            )?,
             transaction_hash: transaction_hash.clone(),
             block_hash: block_hash.clone(),
             block_number,
@@ -240,6 +255,7 @@ pub fn decode_receipt(
 
 #[derive(Default, Debug, Serialize)]
 pub struct Inventory {
+    pub entry_order_id: String,
     pub shares: Decimal,
     pub cost_basis: Decimal,
     pub cycle_pnl: Decimal,
@@ -250,7 +266,7 @@ pub struct Projection {
     pub realized_pnl: Decimal,
     pub fees: Decimal,
     /// One outcome for a completely closed copied position, not per partial fill.
-    pub closed_outcomes: Vec<(String, Decimal)>,
+    pub closed_outcomes: Vec<(String, Decimal, i64)>,
 }
 pub fn project(fills: &[Fill], journal: &BTreeMap<String, Record>) -> anyhow::Result<Projection> {
     let owned: BTreeMap<_, _> = journal
@@ -296,6 +312,9 @@ pub fn project(fills: &[Fill], journal: &BTreeMap<String, Record>) -> anyhow::Re
         result.fees += fill.fee;
         match fill.side {
             TradeSide::BUY => {
+                if position.shares == Decimal::ZERO {
+                    position.entry_order_id = fill.order_id.clone();
+                }
                 position.shares += fill.shares;
                 position.cost_basis += fill.collateral + fill.fee;
             }
@@ -315,6 +334,7 @@ pub fn project(fills: &[Fill], journal: &BTreeMap<String, Record>) -> anyhow::Re
                     result.closed_outcomes.push((
                         format!("{}:{}", fill.transaction_hash, fill.log_index),
                         position.cycle_pnl,
+                        fill.block_timestamp,
                     ));
                     position.cycle_pnl = Decimal::ZERO;
                 }
@@ -322,4 +342,277 @@ pub fn project(fills: &[Fill], journal: &BTreeMap<String, Record>) -> anyhow::Re
         }
     }
     Ok(result)
+}
+
+pub fn stored() -> anyhow::Result<Vec<Fill>> {
+    match std::fs::read_to_string("settlement-fills.json") {
+        Ok(raw) => Ok(serde_json::from_str(&raw)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
+    }
+}
+pub fn sync_risk(risk: &mut crate::risk::RiskEngine) -> anyhow::Result<()> {
+    let book = project(&stored()?, &crate::execution_journal::snapshot()?)?;
+    risk.sync_live_outcomes(&book.closed_outcomes)
+}
+pub fn persist(fills: &[Fill]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create("settlement-fills.json.tmp")?;
+    file.write_all(&serde_json::to_vec_pretty(fills)?)?;
+    file.sync_all()?;
+    std::fs::rename("settlement-fills.json.tmp", "settlement-fills.json")?;
+    #[cfg(unix)]
+    std::fs::File::open(".")?.sync_all()?;
+    Ok(())
+}
+
+pub async fn collect(
+    clob: &crate::clients::AuthedClobClient,
+    funder: &str,
+) -> anyhow::Result<(Vec<Fill>, BTreeMap<String, Record>)> {
+    use polymarket_client_sdk::clob::types::{request::TradesRequest, TradeStatusType};
+    let journal = crate::execution_journal::snapshot()?;
+    let owned: std::collections::HashSet<_> = journal
+        .values()
+        .filter(|r| r.status == "accepted")
+        .filter_map(|r| r.order_id.as_ref().map(|id| id.to_lowercase()))
+        .collect();
+    let mut fills = stored()?;
+    project(&fills, &journal)?;
+    if owned.is_empty() {
+        return Ok((fills, journal));
+    }
+    let earliest = journal
+        .values()
+        .filter(|r| r.status == "accepted")
+        .map(|r| r.created_at)
+        .min()
+        .unwrap();
+    let request = TradesRequest::builder()
+        .after(earliest.saturating_sub(60))
+        .build();
+    let mut cursor = None;
+    let mut cursors = std::collections::HashSet::new();
+    let mut transactions = std::collections::BTreeSet::new();
+    let mut complete = false;
+    for _ in 0..100 {
+        let page = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            clob.trades(&request, cursor),
+        )
+        .await??;
+        for trade in page.data {
+            if trade.status == TradeStatusType::Confirmed
+                && (owned.contains(&trade.taker_order_id.to_lowercase())
+                    || trade
+                        .maker_orders
+                        .iter()
+                        .any(|m| owned.contains(&m.order_id.to_lowercase())))
+            {
+                transactions.insert(format!("{:#x}", trade.transaction_hash));
+            }
+        }
+        if page.next_cursor.is_empty() || page.next_cursor == "LTE=" {
+            complete = true;
+            break;
+        }
+        anyhow::ensure!(
+            cursors.insert(page.next_cursor.clone()),
+            "Repeated fill cursor"
+        );
+        cursor = Some(page.next_cursor);
+    }
+    anyhow::ensure!(complete, "Fill pagination exceeded safety limit");
+    let known: std::collections::BTreeSet<_> =
+        fills.iter().map(|f| f.transaction_hash.clone()).collect();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("polycopier-settlement/0.1")
+        .build()?;
+    let rpc = std::env::var("POLYGON_RPC_URL")
+        .unwrap_or_else(|_| "https://polygon-bor-rpc.publicnode.com".into());
+    for tx in transactions.difference(&known) {
+        if let Some(receipt) = finalized_receipt(&client, &rpc, tx).await? {
+            let decoded = decode_receipt(&receipt, tx, u64::MAX, funder, &journal)?;
+            anyhow::ensure!(
+                !decoded.is_empty(),
+                "Owned transaction has no supported CTF V2 settlement event"
+            );
+            fills.extend(decoded);
+        }
+    }
+    project(&fills, &journal)?;
+    persist(&fills)?;
+    // An absent open order is not evidence of cancellation. Query its exact
+    // owned ID and release a zero-filled entry only on explicit CANCELED.
+    let mut latest = BTreeMap::new();
+    for record in journal
+        .values()
+        .filter(|r| r.status == "accepted" && r.order.side == TradeSide::BUY)
+    {
+        latest.insert(record.order.token_id.clone(), record);
+    }
+    for record in latest.values().filter(|r| !r.terminal_unfilled) {
+        let id = record.order_id.as_ref().unwrap();
+        if fills.iter().any(|f| f.order_id.eq_ignore_ascii_case(id)) {
+            continue;
+        }
+        let order =
+            tokio::time::timeout(std::time::Duration::from_secs(5), clob.order(id)).await??;
+        anyhow::ensure!(
+            order.id.eq_ignore_ascii_case(id)
+                && order.asset_id.to_string() == record.order.token_id,
+            "Unexpected entry order response"
+        );
+        if order.status == polymarket_client_sdk::clob::types::OrderStatusType::Canceled
+            && order.size_matched == Decimal::ZERO
+        {
+            crate::execution_journal::cancel_unfilled(id)?;
+        }
+    }
+    Ok((fills, crate::execution_journal::snapshot()?))
+}
+
+pub async fn apply(
+    fills: &[Fill],
+    journal: &BTreeMap<String, Record>,
+    state: &std::sync::Arc<tokio::sync::RwLock<crate::state::BotState>>,
+    ledger: &std::sync::Arc<tokio::sync::Mutex<crate::copy_ledger::CopyLedger>>,
+) -> anyhow::Result<()> {
+    let projection = project(fills, journal)?;
+    let mut latest = BTreeMap::new();
+    for record in journal
+        .values()
+        .filter(|r| r.status == "accepted" && r.order.side == TradeSide::BUY)
+    {
+        latest.insert(record.order.token_id.clone(), record);
+    }
+    let mut durable_ledger = ledger.lock().await;
+    let mut ledger = durable_ledger.clone();
+    for (token, record) in latest {
+        let id = record
+            .order_id
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Entry order ID missing"))?;
+        let source = record
+            .source_wallet
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Entry source missing; reconcile old journal"))?;
+        let inventory = projection.inventory.get(&token);
+        let this_cycle = inventory.is_some_and(|p| p.entry_order_id.eq_ignore_ascii_case(id));
+        let held = if this_cycle {
+            inventory.unwrap().shares
+        } else {
+            Decimal::ZERO
+        };
+        anyhow::ensure!(
+            this_cycle || inventory.is_none_or(|p| p.shares == Decimal::ZERO),
+            "Entry overlaps unreconciled previous inventory"
+        );
+        let index = ledger.entries.iter().position(|e| {
+            e.entry_order_id
+                .as_ref()
+                .is_some_and(|e| e.eq_ignore_ascii_case(id))
+        });
+        let index = if let Some(index) = index {
+            index
+        } else {
+            if let Some(entry) = ledger.entries.iter_mut().find(|e| {
+                !e.closed
+                    && e.token_id == token
+                    && e.entry_order_id.is_none()
+                    && e.source_wallet.eq_ignore_ascii_case(source)
+            }) {
+                entry.entry_order_id = Some(id.clone());
+            } else {
+                anyhow::ensure!(
+                    !ledger.has_any_active(&token),
+                    "Conflicting active ledger entry"
+                );
+                ledger.record_copy(
+                    token.clone(),
+                    source.clone(),
+                    record.order.size,
+                    record.order.price,
+                );
+                ledger.entries.last_mut().unwrap().entry_order_id = Some(id.clone());
+                ledger.entries.last_mut().unwrap().copied_at =
+                    chrono::DateTime::from_timestamp(record.created_at, 0)
+                        .ok_or_else(|| anyhow::anyhow!("Invalid entry timestamp"))?;
+            }
+            ledger
+                .entries
+                .iter()
+                .position(|e| e.entry_order_id.as_ref() == Some(id))
+                .unwrap()
+        };
+        let entry = &mut ledger.entries[index];
+        anyhow::ensure!(
+            !record.terminal_unfilled || !this_cycle,
+            "Canceled unfilled entry has settlement fills"
+        );
+        entry.filled_size = Some(held);
+        if held > Decimal::ZERO {
+            entry.entry_price = inventory.unwrap().cost_basis / held;
+            entry.closed = false;
+            entry.closed_at = None;
+        }
+        if (this_cycle && held == Decimal::ZERO) || record.terminal_unfilled {
+            entry.closed = true;
+            entry.closed_at.get_or_insert_with(chrono::Utc::now);
+        }
+    }
+    ledger.try_save()?;
+    *durable_ledger = ledger;
+    let mut state = state.write().await;
+    state.copier_positions = projection
+        .inventory
+        .iter()
+        .filter(|(_, p)| p.shares > Decimal::ZERO)
+        .map(|(token, p)| {
+            (
+                token.clone(),
+                crate::models::Position {
+                    token_id: token.clone(),
+                    size: p.shares,
+                    average_entry_price: p.cost_basis / p.shares,
+                },
+            )
+        })
+        .collect();
+    state.realized_pnl = projection.realized_pnl;
+    state.last_live_fill_sync = chrono::Utc::now().timestamp();
+    state.live_fills_ready = true;
+    Ok(())
+}
+pub async fn reconcile(
+    clob: &crate::clients::AuthedClobClient,
+    funder: &str,
+    state: &std::sync::Arc<tokio::sync::RwLock<crate::state::BotState>>,
+    ledger: &std::sync::Arc<tokio::sync::Mutex<crate::copy_ledger::CopyLedger>>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !crate::live_redemption::records()?
+            .values()
+            .any(|r| r.status == "confirmed"),
+        "Redemption payout reconciliation pending"
+    );
+    let (fills, journal) = collect(clob, funder).await?;
+    apply(&fills, &journal, state, ledger).await
+}
+pub fn start(
+    clob: crate::clients::AuthedClobClient,
+    funder: String,
+    state: std::sync::Arc<tokio::sync::RwLock<crate::state::BotState>>,
+    ledger: std::sync::Arc<tokio::sync::Mutex<crate::copy_ledger::CopyLedger>>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if reconcile(&clob, &funder, &state, &ledger).await.is_err() {
+                state.write().await.live_fills_ready = false;
+                tracing::error!("Live settlement reconciliation failed; new execution blocked");
+            }
+        }
+    });
 }

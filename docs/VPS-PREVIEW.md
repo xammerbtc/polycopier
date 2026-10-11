@@ -198,9 +198,28 @@ fills, foreign orders, finality and canonical-header checks. The read-only
 `target/release/receipt_preflight` checks the public fixture against Polygon.
 Set `POLYGON_RPC_URL` for a different Polygon provider if needed. No credentials
 are loaded by that preflight. This does not prove a copier order was executed.
-Continuous CLOB receipt collection and durable risk-outcome replay still need
-wiring; live strategy rejects execution while `live_fills_ready` is false.
+Live startup and a five-second collector paginate authenticated CLOB trades,
+select confirmed transactions for exact journal-owned order IDs, and verify
+finalized Polygon receipts before recording `settlement-fills.json`. Atomic
+ledger recovery uses the source wallet persisted before submission. The live
+dashboard and unrealized PnL use this confirmed inventory, excluding other bots'
+holdings. Collection errors or a snapshot older than 60 seconds block execution
+and resume. Zero-filled entries close only after explicit CLOB CANCELED status.
+Cancellation alone never counts as a loss.
+
+Closed-position outcomes include actual collateral fees. The strategy replays
+them into `runtime-risk.json` every two seconds and before each live signal.
+Persisted outcome IDs prevent double-counting on restart; persistence failures
+block execution. Partial sells do not increment the consecutive-loss counter.
 Live SELL acceptance keeps the ledger open and does not book realized profit.
 Confirmed fill and fee reconciliation remains required before enabling live
 trading; wallet position refresh alone cannot establish execution prices or
 attribute concurrent trades by other bots using the same wallet.
+
+Use `target/release/relayer_preflight /opt/polycopier/.env.credentials` as root
+to check the supplied Relayer API key with the authenticated read-only
+`GET /transactions` endpoint. It prints no keys, wallet addresses or transaction
+contents, and submits no transactions. Credentials remain root-only (0600).
+Preview does not load them. A confirmed live redemption currently blocks fill
+reconciliation until redemption payout accounting is completed; gasless Redeem
+and actual copier order latency are not certified by these checks.

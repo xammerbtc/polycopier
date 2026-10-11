@@ -19,6 +19,8 @@ fn real_public_v2_event_preserves_exact_settlement_fee() {
     let j = BTreeMap::from([(
         "fixture".into(),
         Record {
+            terminal_unfilled: false,
+            source_wallet: Some("0x2d2d2b32e5199edf833594a99b9c54e5668ab69d".into()),
             order: OrderRequest {
                 token_id: token.into(),
                 price: dec!(0.65),
@@ -48,6 +50,8 @@ fn real_public_v2_event_preserves_exact_settlement_fee() {
 }
 fn order(side: TradeSide, id: &str, size: rust_decimal::Decimal) -> Record {
     Record {
+        terminal_unfilled: false,
+        source_wallet: Some(FUNDER.into()),
         order: OrderRequest {
             token_id: "123".into(),
             price: dec!(0.5),
@@ -189,7 +193,7 @@ async fn rpc_requires_polygon_finality_and_matching_canonical_header() {
             let result=match request["method"].as_str().unwrap() {
                 "eth_chainId"=>json!(format!("0x{chain:x}")),
                 "eth_getTransactionReceipt"=>base.clone(),
-                "eth_getBlockByNumber"=>if request["params"][0]=="finalized" {json!({"number":format!("0x{height:x}")})} else {json!({"number":base["blockNumber"],"hash":if canonical {base["blockHash"].clone()} else {json!(format!("0x{}","f".repeat(64)))}})},
+                "eth_getBlockByNumber"=>if request["params"][0]=="finalized" {json!({"number":format!("0x{height:x}")})} else {json!({"timestamp":"0x64","number":base["blockNumber"],"hash":if canonical {base["blockHash"].clone()} else {json!(format!("0x{}","f".repeat(64)))}})},
                 _=>panic!("unexpected RPC method"),
             };
             Json(json!({"jsonrpc":"2.0","id":1,"result":result}))

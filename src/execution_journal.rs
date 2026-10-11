@@ -11,8 +11,14 @@ static LOCK: Mutex<()> = Mutex::new(());
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static BLOCKED: AtomicBool = AtomicBool::new(false);
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static SOURCES: std::sync::LazyLock<Mutex<BTreeMap<String, String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(BTreeMap::new()));
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Record {
+    #[serde(default)]
+    pub terminal_unfilled: bool,
+    #[serde(default)]
+    pub source_wallet: Option<String>,
     pub order: OrderRequest,
     pub status: String,
     pub order_id: Option<String>,
@@ -58,6 +64,26 @@ pub fn initialize() -> anyhow::Result<()> {
     Ok(())
 }
 pub fn begin(order: &OrderRequest) -> anyhow::Result<String> {
+    begin_record(order, None)
+}
+pub fn remember_source(token: &str, source: &str) {
+    SOURCES
+        .lock()
+        .unwrap()
+        .insert(token.into(), source.to_lowercase());
+}
+pub fn clear_source(token: &str) {
+    SOURCES.lock().unwrap().remove(token);
+}
+pub fn begin_contextual(order: &OrderRequest) -> anyhow::Result<String> {
+    let source = SOURCES
+        .lock()
+        .unwrap()
+        .remove(&order.token_id)
+        .ok_or_else(|| anyhow::anyhow!("Submission source context missing"))?;
+    begin_record(order, Some(source))
+}
+fn begin_record(order: &OrderRequest, source_wallet: Option<String>) -> anyhow::Result<String> {
     let _lock = LOCK.lock().unwrap();
     anyhow::ensure!(!blocked(), "Uncertain execution requires reconciliation");
     let mut records = load()?;
@@ -70,6 +96,8 @@ pub fn begin(order: &OrderRequest) -> anyhow::Result<String> {
     records.insert(
         key.clone(),
         Record {
+            terminal_unfilled: false,
+            source_wallet,
             order: order.clone(),
             status: "pending".into(),
             order_id: None,
@@ -106,6 +134,20 @@ pub fn owned_ids() -> anyhow::Result<HashSet<String>> {
 pub fn snapshot() -> anyhow::Result<BTreeMap<String, Record>> {
     let _lock = LOCK.lock().unwrap();
     load()
+}
+pub fn cancel_unfilled(id: &str) -> anyhow::Result<()> {
+    let _lock = LOCK.lock().unwrap();
+    let mut records = load()?;
+    let record = records
+        .values_mut()
+        .find(|r| r.status == "accepted" && r.order_id.as_deref() == Some(id))
+        .ok_or_else(|| anyhow::anyhow!("Owned cancellation missing"))?;
+    anyhow::ensure!(
+        record.order.side == crate::models::TradeSide::BUY,
+        "Cancellation is not an entry"
+    );
+    record.terminal_unfilled = true;
+    save(&records)
 }
 
 pub async fn open_orders(

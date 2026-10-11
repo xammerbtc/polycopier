@@ -12,7 +12,13 @@ pub fn start(state: Arc<RwLock<BotState>>) {
             .build()
             .expect("price client");
         loop {
-            let tokens: Vec<_> = state.read().await.positions.keys().cloned().collect();
+            let tokens: Vec<_> = state
+                .read()
+                .await
+                .reported_positions()
+                .keys()
+                .cloned()
+                .collect();
             let prices: Vec<_> = stream::iter(tokens)
                 .map(|token| {
                     let client = client.clone();
@@ -37,7 +43,7 @@ pub fn start(state: Arc<RwLock<BotState>>) {
             let mut guard = state.write().await;
             guard.position_prices = prices.into_iter().collect();
             guard.unrealized_pnl = guard
-                .positions
+                .reported_positions()
                 .values()
                 .filter_map(|p| {
                     guard

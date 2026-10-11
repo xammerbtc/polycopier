@@ -37,6 +37,7 @@ async fn exact_order_ownership_and_uncertain_startup_protect_shared_wallet() {
     let config = common::test_config();
     let mut initial = BotState::new(false, None);
     initial.live_fills_ready = true;
+    initial.last_live_fill_sync = chrono::Utc::now().timestamp();
     initial.total_balance = dec!(100);
     for token in ["99999", "33333"] {
         initial.positions.insert(

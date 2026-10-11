@@ -101,7 +101,7 @@ pub async fn build_order_submitter(
                 .await?;
 
             let signed_order = clob.sign(&signer, order_req).await?;
-            let intent = crate::execution_journal::begin(&order)?;
+            let intent = crate::execution_journal::begin_contextual(&order)?;
 
             match clob.post_order(signed_order).await {
                 Ok(res) => {

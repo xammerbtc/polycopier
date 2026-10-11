@@ -103,6 +103,21 @@ async fn control(State(api): State<ApiState>, Json(payload): Json<Control>) -> R
         )
             .into_response();
     }
+    if !paused && crate::execution_journal::active() {
+        let guard = api.bot_state.read().await;
+        if !guard.live_fills_ready
+            || chrono::Utc::now()
+                .timestamp()
+                .saturating_sub(guard.last_live_fill_sync)
+                > 60
+        {
+            return (
+                StatusCode::CONFLICT,
+                "Live settlements require reconciliation before resume",
+            )
+                .into_response();
+        }
+    }
     api.bot_state.write().await.started = paused;
     Json(serde_json::json!({"success":true,"paused":paused})).into_response()
 }
@@ -441,8 +456,13 @@ async fn get_state(State(api_state): State<ApiState>) -> Json<StateResponse> {
     let guard = api_state.bot_state.read().await;
 
     let mut position_sources = HashMap::new();
+    let positions = if crate::execution_journal::active() {
+        &guard.copier_positions
+    } else {
+        &guard.positions
+    };
     // Map live holdings
-    for token_id in guard.positions.keys() {
+    for token_id in positions.keys() {
         if let Some(entry) = ledger.find_active_for_token(token_id) {
             position_sources.insert(token_id.clone(), entry.source_wallet.clone());
         } else if let Some(entry) = ledger
@@ -485,7 +505,7 @@ async fn get_state(State(api_state): State<ApiState>) -> Json<StateResponse> {
             })
             .and_then(|v| serde_json::from_value(v["volume"].clone()).ok())
             .unwrap_or(Decimal::ZERO),
-        positions: guard.positions.clone(),
+        positions: positions.clone(),
         live_feed: guard.live_feed.iter().cloned().collect(),
         total_balance: guard.total_balance,
         unrealized_pnl: guard.unrealized_pnl,

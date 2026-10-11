@@ -4,7 +4,10 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 pub struct BotState {
+    pub in_flight_tokens: std::collections::HashSet<String>,
     pub live_fills_ready: bool,
+    pub last_live_fill_sync: i64,
+    pub copier_positions: HashMap<String, Position>,
     pub foreign_order_tokens: std::collections::HashSet<String>,
     pub risk_outcome_tx: Option<tokio::sync::mpsc::UnboundedSender<Decimal>>,
     pub positions: HashMap<String, Position>,
@@ -44,6 +47,13 @@ pub struct BotState {
 }
 
 impl BotState {
+    pub fn reported_positions(&self) -> &HashMap<String, Position> {
+        if crate::execution_journal::active() {
+            &self.copier_positions
+        } else {
+            &self.positions
+        }
+    }
     pub fn new(is_sim: bool, sim_balance: Option<Decimal>) -> Self {
         // Initialize balance to $10,000 for simulation (or override)
         let initial_balance = if is_sim {
@@ -53,7 +63,10 @@ impl BotState {
         };
 
         Self {
+            in_flight_tokens: std::collections::HashSet::new(),
             live_fills_ready: false,
+            last_live_fill_sync: 0,
+            copier_positions: HashMap::new(),
             foreign_order_tokens: std::collections::HashSet::new(),
             risk_outcome_tx: None,
             positions: HashMap::new(),

@@ -17,6 +17,7 @@ use std::time::Instant;
 
 #[derive(Clone)]
 pub struct RiskEngine {
+    seen_live_outcomes: std::collections::BTreeSet<String>,
     config: Config,
 
     // -- Daily volume tracker (Gap 12) ------------------------------------
@@ -40,19 +41,33 @@ pub struct RiskEngine {
 
 impl RiskEngine {
     fn persist(&self) {
+        if let Err(e) = self.persist_result() {
+            tracing::error!("Risk state persistence failed: {e}");
+        }
+    }
+    fn persist_result(&self) -> anyhow::Result<()> {
+        use std::io::Write;
         let Ok(path) = std::env::var("RISK_STATE_PATH") else {
-            return;
+            return Ok(());
         };
         let until = self.cooldown_until.map(|t| {
             chrono::Utc::now().timestamp()
                 + t.saturating_duration_since(Instant::now()).as_secs() as i64
         });
-        let raw = serde_json::json!({"date":self.daily_reset_date,"volume":self.daily_volume_usd,"losses":self.consecutive_losses,"cooldown_until":until});
-        let result = std::fs::write(format!("{path}.tmp"), raw.to_string())
-            .and_then(|_| std::fs::rename(format!("{path}.tmp"), path));
-        if let Err(e) = result {
-            tracing::error!("Risk state persistence failed: {e}");
-        }
+        let raw = serde_json::json!({"date":self.daily_reset_date,"volume":self.daily_volume_usd,"losses":self.consecutive_losses,"cooldown_until":until,"seen_live_outcomes":self.seen_live_outcomes});
+        let mut file = std::fs::File::create(format!("{path}.tmp"))?;
+        file.write_all(raw.to_string().as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(format!("{path}.tmp"), &path)?;
+        #[cfg(unix)]
+        std::fs::File::open(
+            std::path::Path::new(&path)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new(".")),
+        )?
+        .sync_all()?;
+        Ok(())
     }
 
     pub fn restore_persistent(&mut self) -> anyhow::Result<()> {
@@ -65,6 +80,9 @@ impl RiskEngine {
             Err(e) => return Err(e.into()),
         };
         let v: serde_json::Value = serde_json::from_str(&raw)?;
+        if let Some(ids) = v.get("seen_live_outcomes") {
+            self.seen_live_outcomes = serde_json::from_value(ids.clone())?;
+        }
         let date: chrono::NaiveDate = serde_json::from_value(v["date"].clone())?;
         if date == chrono::Utc::now().date_naive() {
             self.daily_volume_usd = serde_json::from_value(v["volume"].clone())?;
@@ -100,7 +118,12 @@ impl RiskEngine {
         }
         self.config.scan_min_amount = min;
         self.config.scan_max_amount = max;
-        self.persist();
+        if crate::execution_journal::active() && result.is_ok() {
+            self.persist_result()
+                .map_err(|_| "Risk state persistence failed".to_string())?;
+        } else {
+            self.persist();
+        }
         result
     }
     pub fn update_config(&mut self, config: Config) {
@@ -122,6 +145,7 @@ impl RiskEngine {
     }
     pub fn new(config: Config) -> Self {
         Self {
+            seen_live_outcomes: std::collections::BTreeSet::new(),
             config,
             daily_volume_usd: Decimal::ZERO,
             daily_reset_date: chrono::Utc::now().date_naive(),
@@ -225,6 +249,10 @@ impl RiskEngine {
     /// Increments the consecutive-loss counter and triggers a cooldown if
     /// the configured threshold is reached.
     pub fn record_loss(&mut self) {
+        self.apply_loss();
+        self.persist();
+    }
+    fn apply_loss(&mut self) {
         if self.config.max_consecutive_losses == 0 {
             return; // feature disabled
         }
@@ -243,6 +271,48 @@ impl RiskEngine {
                 self.config.loss_cooldown_secs
             );
         }
-        self.persist();
+    }
+    pub fn sync_live_outcomes(
+        &mut self,
+        outcomes: &[(String, Decimal, i64)],
+    ) -> anyhow::Result<()> {
+        let mut next = self.clone();
+        let now = chrono::Utc::now();
+        if next.daily_reset_date != now.date_naive() {
+            next.daily_reset_date = now.date_naive();
+            next.daily_volume_usd = Decimal::ZERO;
+            next.consecutive_losses = 0;
+        }
+        let mut changed = next.daily_reset_date != self.daily_reset_date;
+        for (id, pnl, timestamp) in outcomes {
+            if !next.seen_live_outcomes.insert(id.clone()) {
+                continue;
+            }
+            changed = true;
+            let at = chrono::DateTime::from_timestamp(*timestamp, 0)
+                .ok_or_else(|| anyhow::anyhow!("Invalid realized outcome timestamp"))?;
+            if at.date_naive() != now.date_naive() {
+                continue;
+            }
+            if *pnl < Decimal::ZERO {
+                next.apply_loss();
+                if next.cooldown_until.is_some() {
+                    let remaining = timestamp.saturating_add(next.config.loss_cooldown_secs as i64)
+                        - now.timestamp();
+                    next.cooldown_until = if remaining > 0 {
+                        Some(Instant::now() + std::time::Duration::from_secs(remaining as u64))
+                    } else {
+                        None
+                    };
+                }
+            } else if *pnl > Decimal::ZERO {
+                next.consecutive_losses = 0;
+            }
+        }
+        if changed {
+            next.persist_result()?;
+            *self = next;
+        }
+        Ok(())
     }
 }

@@ -45,6 +45,8 @@ const LEDGER_PATH: &str = "copy_ledger.json";
 /// A single copy-trade record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CopyEntry {
+    #[serde(default)]
+    pub entry_order_id: Option<String>,
     /// Polymarket outcome token ID (U256 as decimal string).
     pub token_id: String,
     /// Target wallet we copied this position from (normalized to lowercase).
@@ -65,7 +67,7 @@ pub struct CopyEntry {
 }
 
 /// In-memory copy of the on-disk ledger.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CopyLedger {
     pub entries: Vec<CopyEntry>,
     /// Path to the backing JSON file.  Empty string means in-memory only
@@ -133,22 +135,29 @@ impl CopyLedger {
     /// No-op if this is an in-memory-only ledger (path is empty).
     /// Logs a warning on failure but never panics.
     pub fn save(&self) {
+        if let Err(e) = self.try_save() {
+            tracing::warn!("Failed to persist copy ledger: {e}");
+        }
+    }
+    pub fn try_save(&self) -> anyhow::Result<()> {
+        use std::io::Write;
         if self.path.is_empty() {
-            return; // in-memory mode — no disk persistence
+            return Ok(());
         }
         let tmp = format!("{}.tmp", self.path);
-        match serde_json::to_string_pretty(self) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&tmp, &json) {
-                    tracing::warn!("Failed to write tmp ledger {}: {e}", tmp);
-                    return;
-                }
-                if let Err(e) = std::fs::rename(&tmp, &self.path) {
-                    tracing::warn!("Failed to rename tmp ledger to {}: {e}", self.path);
-                }
-            }
-            Err(e) => tracing::warn!("Failed to serialise copy_ledger: {e}"),
-        }
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&serde_json::to_vec_pretty(self)?)?;
+        file.sync_all()?;
+        std::fs::rename(tmp, &self.path)?;
+        #[cfg(unix)]
+        std::fs::File::open(
+            std::path::Path::new(&self.path)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new(".")),
+        )?
+        .sync_all()?;
+        Ok(())
     }
 
     // -- Mutations ----------------------------------------------------------
@@ -169,6 +178,7 @@ impl CopyLedger {
             "record_copy called but an active copy for {token_id} already exists"
         );
         self.entries.push(CopyEntry {
+            entry_order_id: None,
             token_id,
             source_wallet,
             size,

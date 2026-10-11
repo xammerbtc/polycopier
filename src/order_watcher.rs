@@ -122,7 +122,7 @@ async fn run_once(
         let mut guard = state.write().await;
         let mut ghosts = Vec::new();
         for tid in guard.pending_orders.keys() {
-            if !open_tokens.contains(tid) {
+            if !open_tokens.contains(tid) && !guard.in_flight_tokens.contains(tid) {
                 ghosts.push(tid.clone());
             }
         }
@@ -258,7 +258,7 @@ async fn run_once(
 
                 // Gap C: notify risk engine when a loss-triggered cancel fires.
                 // This increments the consecutive-loss counter and may trigger cooldown.
-                if is_loss_cancel {
+                if is_loss_cancel && !crate::execution_journal::active() {
                     if let Some(tx) = state.read().await.risk_outcome_tx.clone() {
                         let _ = tx.send(Decimal::NEGATIVE_ONE);
                     }

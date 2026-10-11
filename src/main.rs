@@ -279,13 +279,32 @@ async fn main() -> anyhow::Result<()> {
     // No strategy or signal producer runs before authoritative wallet/order seeds.
     // A failed wallet read is not an empty wallet.
     if !config.is_sim {
+        if std::env::var_os("RISK_STATE_PATH").is_none() {
+            std::env::set_var("RISK_STATE_PATH", "runtime-risk.json");
+        }
         wallet_sync::seed_own_positions(&config.funder_address, state.clone()).await?;
         wallet_sync::seed_pending_orders(clob.as_ref().expect("live client"), state.clone())
             .await?;
+        live_fills::reconcile(
+            clob.as_ref().expect("live client"),
+            &config.funder_address,
+            &state,
+            &copy_ledger,
+        )
+        .await?;
     }
 
     let mut strategy_risk = risk::RiskEngine::new(config.clone());
     strategy_risk.restore_persistent()?;
+    if !config.is_sim {
+        live_fills::sync_risk(&mut strategy_risk)?;
+        live_fills::start(
+            clob.as_ref().expect("live client").clone(),
+            config.funder_address.clone(),
+            state.clone(),
+            copy_ledger.clone(),
+        );
+    }
     strategy::start_strategy_engine(
         event_rx,
         state.clone(),

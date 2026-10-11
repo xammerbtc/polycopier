@@ -243,7 +243,7 @@ pub fn start_price_refresh(target_wallets: Vec<String>, state: State) {
                 // to avg_entry (PnL = 0) when a token is absent from price_map.
                 // This is correct regardless of whether a target has already closed.
                 let unrealized: Decimal = g
-                    .positions
+                    .reported_positions()
                     .values()
                     .map(|p| {
                         let cur = price_map

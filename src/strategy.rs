@@ -367,10 +367,18 @@ pub fn start_strategy_engine(
         let mut event_count: u32 = 0;
         let (outcome_tx, mut outcome_rx) = mpsc::unbounded_channel::<Decimal>();
         state.write().await.risk_outcome_tx = Some(outcome_tx.clone());
+        let mut risk_tick = tokio::time::interval(std::time::Duration::from_secs(2));
 
         loop {
             let event = tokio::select! {
                 biased;
+                _ = risk_tick.tick() => {
+                    if crate::execution_journal::active() && crate::live_fills::sync_risk(&mut risk_engine).is_err() {
+                        state.write().await.live_fills_ready = false;
+                        tracing::error!("Live risk reconciliation failed; execution blocked");
+                    }
+                    continue;
+                }
                 Some(pnl) = outcome_rx.recv() => {
                     if pnl < Decimal::ZERO { risk_engine.record_loss(); }
                     else if pnl > Decimal::ZERO { risk_engine.record_win(); }
@@ -387,6 +395,11 @@ pub fn start_strategy_engine(
             }
             config.hot_reload();
             risk_engine.update_config(config.clone());
+            if crate::execution_journal::active()
+                && crate::live_fills::sync_risk(&mut risk_engine).is_err()
+            {
+                state.write().await.live_fills_ready = false;
+            }
             event_count += 1;
             // Evict expired live-query cache entries every 50 events (Gap 13)
             if event_count.is_multiple_of(50) {
@@ -407,7 +420,12 @@ pub fn start_strategy_engine(
             // 1. Is it a filled trade from the target wallet list?
             if crate::execution_journal::active() {
                 let guard = state.read().await;
-                if !guard.live_fills_ready {
+                if !guard.live_fills_ready
+                    || chrono::Utc::now()
+                        .timestamp()
+                        .saturating_sub(guard.last_live_fill_sync)
+                        > 60
+                {
                     eval.validated = false;
                     eval.reason = Some("Live fills have not been reconciled".into());
                 }
@@ -622,7 +640,9 @@ pub fn start_strategy_engine(
                                 &entry.source_wallet[..entry.source_wallet.len().min(10)],
                             );
                             let mut ledger = copy_ledger.lock().await;
-                            ledger.record_close(&event.token_id, &entry.source_wallet.clone());
+                            if !crate::execution_journal::active() {
+                                ledger.record_close(&event.token_id, &entry.source_wallet.clone());
+                            }
                             Some(
                                 "SELL skipped: position already closed (ledger synced)".to_string(),
                             )
@@ -838,6 +858,7 @@ pub fn start_strategy_engine(
                     // events for the same token are blocked immediately.
                     {
                         let mut guard = state.write().await;
+                        guard.in_flight_tokens.insert(order.token_id.clone());
                         guard.pending_orders.insert(
                             order.token_id.clone(),
                             crate::models::QueuedOrder {
@@ -881,8 +902,16 @@ pub fn start_strategy_engine(
                     let latency_event = event.clone();
 
                     tokio::spawn(async move {
+                        if crate::execution_journal::active() {
+                            crate::execution_journal::remember_source(
+                                &token_id_clone,
+                                &source_wallet_clone,
+                            );
+                        }
                         crate::latency::dispatch(&latency_event);
-                        match submitter_clone(order).await {
+                        let submitted = submitter_clone(order).await;
+                        crate::execution_journal::clear_source(&token_id_clone);
+                        match submitted {
                             Ok(()) => {
                                 crate::latency::accepted(&latency_event);
                                 let mut ledger = ledger_clone.lock().await;
@@ -917,12 +946,16 @@ pub fn start_strategy_engine(
                                         guard.unrealized_pnl -= old_unrealized;
                                     }
                                 } else {
-                                    ledger.record_copy(
-                                        token_id_clone.clone(),
-                                        source_wallet_clone.clone(),
-                                        order_size,
-                                        order_price,
-                                    );
+                                    if !crate::execution_journal::active()
+                                        || !ledger.has_any_active(&token_id_clone)
+                                    {
+                                        ledger.record_copy(
+                                            token_id_clone.clone(),
+                                            source_wallet_clone.clone(),
+                                            order_size,
+                                            order_price,
+                                        );
+                                    }
                                     info!(
                                         "Ledger: recorded copy of {} from {}",
                                         &token_id_clone[..token_id_clone.len().min(12)],
@@ -985,6 +1018,11 @@ pub fn start_strategy_engine(
                                 tracing::error!("Execution failed: {}", e);
                             }
                         }
+                        state_clone
+                            .write()
+                            .await
+                            .in_flight_tokens
+                            .remove(&token_id_clone);
                     });
                 }
             } else {
