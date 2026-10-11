@@ -1568,6 +1568,57 @@ mod strategy_engine_tests {
         assert_eq!(orders[0].side, TradeSide::SELL);
     }
 
+    #[tokio::test]
+    async fn paper_sell_preserves_fractional_residual_and_accounts_sell_fee() {
+        let mut config = test_config();
+        config.is_sim = true;
+        let mut initial = BotState::new(true, Some(dec!(100)));
+        initial.positions.insert(
+            "99999".into(),
+            Position {
+                token_id: "99999".into(),
+                size: dec!(20.003),
+                average_entry_price: dec!(0.50),
+            },
+        );
+        let state = Arc::new(RwLock::new(initial));
+        let ledger = Arc::new(tokio::sync::Mutex::new({
+            let mut ledger = CopyLedger::new_in_memory();
+            ledger.record_copy("99999".into(), "0xabc".into(), dec!(20.003), dec!(0.50));
+            ledger
+        }));
+        let log = Arc::new(Mutex::new(vec![]));
+        let (tx, rx) = mpsc::channel(10);
+        start_strategy_engine(
+            rx,
+            state.clone(),
+            RiskEngine::new(config.clone()),
+            mock_submitter(log.clone()),
+            config,
+            ledger,
+            make_no_op_holds_query(),
+            make_no_op_end_date_query(),
+        );
+        tx.send(make_trade("0xabc", dec!(0.60), dec!(30), TradeSide::SELL))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.read().await.realized_pnl != Decimal::ZERO {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let guard = state.read().await;
+        assert_eq!(guard.positions["99999"].size, dec!(0.003));
+        let fee = dec!(20) * dec!(0.02) * dec!(0.59) * dec!(0.41);
+        assert_eq!(guard.total_balance, dec!(100) + dec!(20) * dec!(0.59) - fee);
+        assert_eq!(guard.realized_pnl, dec!(20) * dec!(0.09) - fee);
+    }
+
     /// A SELL from a DIFFERENT target wallet (not the one we copied from) is
     /// ignored — we keep holding for the target we actually copied from.
     #[tokio::test]

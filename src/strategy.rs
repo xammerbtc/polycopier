@@ -354,8 +354,18 @@ pub fn start_strategy_engine(
         // Periodic cache maintenance counter
         let mut event_count: u32 = 0;
         let (outcome_tx, mut outcome_rx) = mpsc::unbounded_channel::<Decimal>();
+        state.write().await.risk_outcome_tx = Some(outcome_tx.clone());
 
-        while let Some(event) = rx.recv().await {
+        loop {
+            let event = tokio::select! {
+                biased;
+                Some(pnl) = outcome_rx.recv() => {
+                    if pnl < Decimal::ZERO { risk_engine.record_loss(); }
+                    else if pnl > Decimal::ZERO { risk_engine.record_win(); }
+                    continue;
+                }
+                event = rx.recv() => match event { Some(event) => event, None => break },
+            };
             while let Ok(pnl) = outcome_rx.try_recv() {
                 if pnl < Decimal::ZERO {
                     risk_engine.record_loss();
@@ -814,8 +824,10 @@ pub fn start_strategy_engine(
 
                     let is_sim = config.is_sim;
                     let outcome_tx = outcome_tx.clone();
+                    let latency_event = event.clone();
 
                     tokio::spawn(async move {
+                        crate::latency::dispatch(&latency_event);
                         match submitter_clone(order).await {
                             Ok(()) => {
                                 let mut ledger = ledger_clone.lock().await;
@@ -829,15 +841,19 @@ pub fn start_strategy_engine(
                                     // Accumulate realized PnL
                                     if let Some(avg_entry) = entry_price {
                                         let pnl = (order_price - avg_entry) * order_size;
-                                        if is_sim {
-                                            let fee = order_size
+                                        let fee = if is_sim {
+                                            order_size
                                                 * Decimal::new(2, 2)
                                                 * order_price
-                                                * (Decimal::ONE - order_price);
+                                                * (Decimal::ONE - order_price)
+                                        } else {
+                                            Decimal::ZERO
+                                        };
+                                        if is_sim {
                                             let _ = outcome_tx.send(pnl - fee);
                                         }
                                         let mut guard = state_clone.write().await;
-                                        guard.realized_pnl += pnl;
+                                        guard.realized_pnl += pnl - fee;
                                         // Subtract this token's contribution from unrealized;
                                         // price refresh corrects the full sum within 20s.
                                         let old_unrealized = (order_price - avg_entry) * order_size;
@@ -866,7 +882,15 @@ pub fn start_strategy_engine(
                                         * (rust_decimal::Decimal::ONE - order_price);
 
                                     if is_closing {
-                                        guard.positions.remove(&token_id_clone);
+                                        if let Some(position) =
+                                            guard.positions.get_mut(&token_id_clone)
+                                        {
+                                            position.size =
+                                                (position.size - order_size).max(Decimal::ZERO);
+                                            if position.size == Decimal::ZERO {
+                                                guard.positions.remove(&token_id_clone);
+                                            }
+                                        }
                                         guard.total_balance +=
                                             (order_size * order_price) - max_ctf_fee;
                                     } else {

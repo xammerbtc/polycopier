@@ -6,6 +6,18 @@ export default function Operations() {
   const [lines, setLines] = useState<string[]>([]);
   const [wallet, setWallet] = useState('');
   const [date, setDate] = useState('');
+  const [redeeming, setRedeeming] = useState(false);
+  const [redeemResult, setRedeemResult] = useState('');
+  async function redeem() {
+    setRedeeming(true);
+    try {
+      const response = await fetch('/api/redeem', {method:'POST'});
+      if (!response.ok) throw new Error(await response.text());
+      const result = await response.json();
+      setRedeemResult(`Paper redemption: ${result.settled.length} positions settled; ${result.lookup_failures.length} lookup failures. No on-chain transaction.`);
+    } catch (error) { setRedeemResult(String(error)); }
+    finally { setRedeeming(false); }
+  }
   useEffect(() => {
     const refresh = () => {
       fetch('/api/ledger').then(r => r.json()).then(v => setEntries(v.entries || [])).catch(() => {});
@@ -20,8 +32,9 @@ export default function Operations() {
       <input placeholder="Filter source wallet" value={wallet} onChange={e => setWallet(e.target.value)} />
       <input type="date" value={date} onChange={e => setDate(e.target.value)} />
       <a href="/api/config" download="config.json">Export config</a><a href="/api/ledger" download="ledger.json">Export ledger</a>
-      <button disabled title="On-chain redemption requires live execution; dry-run is active">Force Redeem (dry-run blocked)</button>
+      <button disabled={redeeming} onClick={redeem} title="Settle resolved paper positions using verified winner flags">{redeeming ? 'Checking resolution…' : 'Force Redeem (paper)'}</button>
     </div>
+    {redeemResult && <p role="status">{redeemResult}</p>}
     <div className="table-container"><table><thead><tr><th>Time (UTC)</th><th>Source wallet</th><th>Token</th><th>Entry</th><th>Size</th><th>Status</th></tr></thead><tbody>
       {filtered.slice().reverse().map((e,i) => <tr key={i}><td>{e.copied_at}</td><td>{e.source_wallet}</td><td>{e.token_id.slice(0,16)}</td><td>{e.entry_price}</td><td>{e.size}</td><td>{e.closed ? 'Closed' : 'Open'}</td></tr>)}
       {!filtered.length && <tr><td colSpan={6}>No copied trades recorded for this filter.</td></tr>}

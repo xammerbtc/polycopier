@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 pub struct BotState {
+    pub risk_outcome_tx: Option<tokio::sync::mpsc::UnboundedSender<Decimal>>,
     pub positions: HashMap<String, Position>,
     pub position_prices: HashMap<String, Decimal>,
     pub prices_updated_at: u64,
@@ -50,6 +51,7 @@ impl BotState {
         };
 
         Self {
+            risk_outcome_tx: None,
             positions: HashMap::new(),
             position_prices: HashMap::new(),
             prices_updated_at: 0,

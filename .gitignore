@@ -43,6 +43,8 @@ dummy.json
 npm-audit.json
 rust-audit.json
 rust-audit.exit
+rust-audit.err
+preview-update.tar
 .agents/
 
 src/bin/order_test.rs

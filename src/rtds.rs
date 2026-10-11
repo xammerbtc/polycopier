@@ -118,7 +118,7 @@ pub async fn start(config: &Config, tx: mpsc::Sender<TradeEvent>) -> anyhow::Res
                             errors = 0;
                             match msg {
                                 Message::Text(body) => if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                                    if let Some(e) = parse_activity(&v, &cfg.target_wallets) { raw_tx.send(e).await.map_err(|_| anyhow::anyhow!("listener closed"))?; }
+                                    if let Some(e) = parse_activity(&v, &cfg.target_wallets) { crate::latency::receive(&e, "websocket"); raw_tx.send(e).await.map_err(|_| anyhow::anyhow!("listener closed"))?; }
                                 },
                                 Message::Ping(p) => socket.send(Message::Pong(p)).await?,
                                 Message::Close(_) => anyhow::bail!("RTDS closed"),

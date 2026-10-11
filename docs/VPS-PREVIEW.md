@@ -92,11 +92,34 @@ All paths except `/health` require Basic authentication.
 | POST | `/api/control` | `{"action":"pause"}`, `stop`, `start`, or `resume` |
 | GET | `/api/ledger` | Copy history and ledger export |
 | GET | `/api/logs` | Last 200 file-log lines |
+| GET | `/api/metrics` | Target-stream counters and last order latency observations |
+| POST | `/api/redeem` | Settle resolved paper positions; no on-chain transactions |
 | POST | `/api/action/restart` | Replace only the polycopier process, preserving CLI simulation flags |
 
 The secret-writing `/api/env` POST is disabled. Credential changes belong in a
-secure server-side workflow. Force Redeem is visibly blocked in dry-run because
-it sends an on-chain transaction; it is not a claim of completed redemption.
+secure server-side workflow. Force Redeem in preview verifies a closed binary
+market with exactly one winner through Gamma/CLOB, credits paper payout, persists
+state, and closes ledger records. Lookup failures and ambiguous resolutions leave
+positions unchanged. Repeated requests cannot pay out a removed position twice.
+Live redemption returns HTTP 422 until a verified Safe/Relayer integration exists.
+This preview never submits an on-chain redemption.
+
+Metrics distinguish websocket and polling observations. Fill timestamps have
+one-second precision, so fill-to-dispatch is reported as an upper bound, while
+receive-to-dispatch uses a monotonic clock. These are dispatch observations,
+not confirmation of a live order accepted by the exchange. A null observation
+means no qualifying order has been dispatched since startup.
+
+## Dependency audit
+
+The locked Rust dependency audit on 2026-10-11 found zero advisories classified
+as vulnerabilities, plus five unmaintained-crate warnings and three soundness
+warnings in `lru` 0.12.5/0.16.4 via ratatui/alloy-provider. The panic-safety
+warning requires panicking key destructors; these consumers use Rect/Layout,
+B256, and block-number keys. The ratatui cache does not use LRU IterMut. These
+observations limit applicability; they do not erase upstream warnings. Replacing
+those dependencies requires a separate compatibility upgrade. Frontend npm audit
+after compatible updates reports zero vulnerabilities.
 
 ## Operations and rollback
 

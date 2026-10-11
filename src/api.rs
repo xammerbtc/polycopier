@@ -117,6 +117,96 @@ async fn logs() -> Json<serde_json::Value> {
     Json(serde_json::json!({"lines":lines}))
 }
 
+async fn redeem(State(api): State<ApiState>) -> Response {
+    if std::env::var("POLYCOPIER_MODE").as_deref() != Ok("simulation") {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Live redemption requires a verified wallet/relayer integration",
+        )
+            .into_response();
+    }
+    let tokens: Vec<_> = api
+        .bot_state
+        .read()
+        .await
+        .positions
+        .keys()
+        .cloned()
+        .collect();
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let mut resolved = Vec::new();
+    let mut failed = Vec::new();
+    for token in tokens {
+        match crate::redemption::resolved_payout(&client, &token).await {
+            Ok(Some(payout)) => resolved.push((token, payout)),
+            Ok(None) => {}
+            Err(_) => failed.push(token),
+        }
+    }
+    let mut ledger = api.copy_ledger.lock().await;
+    let mut state = api.bot_state.write().await;
+    if !state.pending_orders.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            "Wait for pending paper orders to finish",
+        )
+            .into_response();
+    }
+    let old_positions = state.positions.clone();
+    let old_balance = state.total_balance;
+    let old_pnl = state.realized_pnl;
+    let mut settled = Vec::new();
+    for (token, payout) in resolved {
+        if let Some((proceeds, pnl)) = crate::redemption::settle_paper(&mut state, &token, payout) {
+            settled.push((token, proceeds, pnl));
+        }
+    }
+    if let Err(e) = crate::simulation::save(&state) {
+        state.positions = old_positions;
+        state.total_balance = old_balance;
+        state.realized_pnl = old_pnl;
+        tracing::error!("Paper redemption persistence failed: {e}");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    for (token, _, pnl) in &settled {
+        state.position_prices.remove(token);
+        if let Some(tx) = &state.risk_outcome_tx {
+            let _ = tx.send(*pnl);
+        }
+        let sources: Vec<_> = ledger
+            .entries
+            .iter()
+            .filter(|e| !e.closed && e.token_id == *token)
+            .map(|e| e.source_wallet.clone())
+            .collect();
+        for source in sources {
+            ledger.record_close(token, &source);
+        }
+    }
+    state.unrealized_pnl = state
+        .positions
+        .values()
+        .filter_map(|p| {
+            state
+                .position_prices
+                .get(&p.token_id)
+                .map(|price| (*price - p.average_entry_price) * p.size)
+        })
+        .sum();
+    tracing::info!(
+        "Force Redeem (paper): settled {} positions, {} lookup failures",
+        settled.len(),
+        failed.len()
+    );
+    Json(serde_json::json!({"mode":"simulation","settled":settled,"lookup_failures":failed,"on_chain_transactions":0})).into_response()
+}
+
 #[derive(Clone)]
 pub struct ApiState {
     pub bot_state: Arc<RwLock<BotState>>,
@@ -373,6 +463,11 @@ pub fn create_router(
         .route("/api/control", post(control))
         .route("/api/ledger", get(export_ledger))
         .route("/api/logs", get(logs))
+        .route(
+            "/api/metrics",
+            get(|| async { Json(crate::latency::snapshot()) }),
+        )
+        .route("/api/redeem", post(redeem))
         .route("/health", get(health))
         .route("/api/action/restart", post(restart))
         .with_state(state)

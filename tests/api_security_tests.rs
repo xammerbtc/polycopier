@@ -59,6 +59,20 @@ async fn dashboard_requires_authentication_and_never_returns_key() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    std::env::set_var("POLYCOPIER_MODE", "live");
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/redeem")
+                .header("authorization", &header)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let response = router
         .oneshot(
             Request::builder()

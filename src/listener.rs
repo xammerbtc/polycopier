@@ -121,16 +121,13 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
                         timestamp: trade.timestamp,
                     };
 
-                    evict_and_insert(&mut seen_hashes, &mut seen_order, hash);
-
                     // Gap 10: use try_send instead of send().await to avoid
                     // blocking the polling loop when the strategy channel is full.
+                    crate::latency::receive(&event, "polling");
                     match tx.try_send(event) {
-                        Ok(()) => {}
+                        Ok(()) => evict_and_insert(&mut seen_hashes, &mut seen_order, hash),
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            warn!(
-                                "Listener: strategy channel full — dropping event (backpressure)"
-                            );
+                            warn!("Listener: strategy channel full — retrying event on next poll");
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                             error!("Listener: strategy channel closed — shutting down listener.");
