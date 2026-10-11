@@ -96,6 +96,13 @@ async fn control(State(api): State<ApiState>, Json(payload): Json<Control>) -> R
         "start" | "resume" => false,
         _ => return (StatusCode::BAD_REQUEST, "Unknown action").into_response(),
     };
+    if !paused && crate::execution_journal::blocked() {
+        return (
+            StatusCode::CONFLICT,
+            "Uncertain execution requires reconciliation before resume",
+        )
+            .into_response();
+    }
     api.bot_state.write().await.started = paused;
     Json(serde_json::json!({"success":true,"paused":paused})).into_response()
 }
@@ -118,12 +125,15 @@ async fn logs() -> Json<serde_json::Value> {
 }
 
 async fn redeem(State(api): State<ApiState>) -> Response {
-    if std::env::var("POLYCOPIER_MODE").as_deref() != Ok("simulation") {
+    let Ok(_request_guard) = api.redemption_lock.try_lock() else {
         return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Live redemption requires a verified wallet/relayer integration",
+            StatusCode::CONFLICT,
+            "A redemption request is already running",
         )
             .into_response();
+    };
+    if std::env::var("POLYCOPIER_MODE").as_deref() != Ok("simulation") {
+        return redeem_live(&api).await;
     }
     let tokens: Vec<_> = api
         .bot_state
@@ -207,8 +217,129 @@ async fn redeem(State(api): State<ApiState>) -> Response {
     Json(serde_json::json!({"mode":"simulation","settled":settled,"lookup_failures":failed,"on_chain_transactions":0})).into_response()
 }
 
+async fn redeem_live(api: &ApiState) -> Response {
+    if std::env::var("POLYCOPIER_MODE").as_deref() != Ok("live")
+        || !crate::live_redemption::configured()
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Live Redeem needs explicit enablement, signer/wallet and Relayer credentials",
+        )
+            .into_response();
+    }
+    let journal = match crate::live_redemption::records() {
+        Ok(journal) => journal,
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Cannot read redemption journal",
+            )
+                .into_response()
+        }
+    };
+    let tokens: Vec<_> = {
+        let ledger = api.copy_ledger.lock().await;
+        let state = api.bot_state.read().await;
+        if !state.pending_orders.is_empty() {
+            return (
+                StatusCode::CONFLICT,
+                "Wait for pending copier orders to finish",
+            )
+                .into_response();
+        }
+        state
+            .positions
+            .keys()
+            .filter(|token| ledger.find_active_for_token(token).is_some())
+            .cloned()
+            .collect()
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let mut markets = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for token in tokens {
+        match crate::redemption::resolved_payout(&client, &token).await {
+            Ok(Some(_)) => match crate::live_redemption::market_id(&client, &token).await {
+                Ok(id) => {
+                    markets.entry(id).or_default().push(token);
+                }
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        "Market lookup failed; no redemption submitted",
+                    )
+                        .into_response()
+                }
+            },
+            Ok(None) => {}
+            Err(_) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    "Resolution lookup failed; no redemption submitted",
+                )
+                    .into_response()
+            }
+        }
+    }
+    if markets.keys().any(|market| {
+        journal
+            .get(market)
+            .is_some_and(|record| record.status != "confirmed")
+    }) {
+        return (
+            StatusCode::CONFLICT,
+            "Uncertain prior redemption requires chain/Relayer reconciliation",
+        )
+            .into_response();
+    }
+    let mut receipts = Vec::new();
+    for (market_id, tokens) in markets {
+        if journal.contains_key(&market_id) {
+            continue;
+        }
+        match crate::live_redemption::execute(&market_id).await {
+            Ok(receipt) => {
+                let mut ledger = api.copy_ledger.lock().await;
+                let mut state = api.bot_state.write().await;
+                for token in tokens {
+                    let sources: Vec<_> = ledger
+                        .entries
+                        .iter()
+                        .filter(|entry| !entry.closed && entry.token_id == token)
+                        .map(|entry| entry.source_wallet.clone())
+                        .collect();
+                    for source in sources {
+                        ledger.record_close(&token, &source);
+                    }
+                    state.positions.remove(&token);
+                    state.position_prices.remove(&token);
+                }
+                receipts.push(receipt);
+            }
+            Err(e) => {
+                tracing::error!("Live redemption of market {market_id} needs reconciliation: {e}");
+                return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"error":"Redemption incomplete; inspect protected journal before retrying","confirmed_receipts":receipts}))).into_response();
+            }
+        }
+    }
+    Json(serde_json::json!({"mode":"live","on_chain_transactions":receipts.len(),"receipts":receipts})).into_response()
+}
+
+async fn redemption_status() -> Response {
+    match crate::live_redemption::records() {
+        Ok(records) => Json(serde_json::json!({"live_configured":crate::live_redemption::configured(),"records":records})).into_response(),
+        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "Cannot read redemption journal").into_response(),
+    }
+}
+
 #[derive(Clone)]
 pub struct ApiState {
+    pub redemption_lock: Arc<tokio::sync::Mutex<()>>,
     pub bot_state: Arc<RwLock<BotState>>,
     pub copy_ledger: Arc<tokio::sync::Mutex<crate::copy_ledger::CopyLedger>>,
 }
@@ -448,6 +579,7 @@ pub fn create_router(
     use tower_http::services::{ServeDir, ServeFile};
 
     let state = ApiState {
+        redemption_lock: Arc::new(tokio::sync::Mutex::new(())),
         bot_state,
         copy_ledger,
     };
@@ -468,6 +600,16 @@ pub fn create_router(
             get(|| async { Json(crate::latency::snapshot()) }),
         )
         .route("/api/redeem", post(redeem))
+        .route("/api/redemption", get(redemption_status))
+        .route(
+            "/api/executions",
+            get(|| async {
+                match crate::execution_journal::snapshot() {
+                    Ok(records) => Json(serde_json::json!(records)).into_response(),
+                    Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                }
+            }),
+        )
         .route("/health", get(health))
         .route("/api/action/restart", post(restart))
         .with_state(state)

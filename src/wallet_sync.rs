@@ -19,7 +19,6 @@ use crate::copy_ledger::CopyLedger;
 use crate::models::{Position, TradeEvent, TradeSide};
 use crate::state::BotState;
 use alloy::primitives::Address;
-use polymarket_client_sdk::clob::types::request::OrdersRequest;
 use polymarket_client_sdk::data::Client as DataClient;
 use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
@@ -67,32 +66,42 @@ pub async fn seed_own_positions(funder: &str, state: State) {
 }
 
 // ---------------------------------------------------------------------------
-// 1b. Clear pending orders — startup routine ensures a clean slate
-//    by brutally cancelling all LIVE orders.
+// 1b. Restore copier-owned orders and preserve every foreign order.
 // ---------------------------------------------------------------------------
-pub async fn seed_pending_orders(clob: &AuthedClobClient, _state: State) {
-    let req = OrdersRequest::default();
-    match clob.orders(&req, None).await {
-        Ok(page) => {
-            let live = page
-                .data
-                .into_iter()
-                .filter(|o| format!("{:?}", o.status).to_uppercase().contains("LIVE"))
-                .collect::<Vec<_>>();
-            let count = live.len();
-            if count > 0 {
-                tracing::warn!("Startup: Found {} active limit orders. Enforcing strict cleanup policies (cancelling all).", count);
-                for o in live {
-                    if let Err(e) = clob.cancel_order(&o.id).await {
-                        tracing::error!("Failed to cancel startup order {}: {}", o.id, e);
-                    } else {
-                        tracing::info!("Cancelled startup order {}", o.id);
-                    }
-                }
-            }
+pub async fn seed_pending_orders(clob: &AuthedClobClient, state: State) -> anyhow::Result<()> {
+    let owned = crate::execution_journal::owned_ids()?;
+    let orders = crate::execution_journal::open_orders(clob).await?;
+    let mut guard = state.write().await;
+    for order in orders
+        .into_iter()
+        .filter(|o| format!("{:?}", o.status).to_uppercase().contains("LIVE"))
+    {
+        let token = order.asset_id.to_string();
+        if !owned.contains(&order.id) {
+            guard.foreign_order_tokens.insert(token);
+            continue;
         }
-        Err(e) => tracing::warn!("Could not fetch pending CLOB orders on startup: {}", e),
+        guard.pending_orders.insert(
+            token.clone(),
+            crate::models::QueuedOrder {
+                token_id: token,
+                price: order.price,
+                size: order.original_size - order.size_matched,
+                side: if format!("{:?}", order.side).to_uppercase().contains("BUY") {
+                    TradeSide::BUY
+                } else {
+                    TradeSide::SELL
+                },
+                event_end_date: None,
+            },
+        );
     }
+    tracing::info!(
+        "Restored {} copier orders; preserved {} foreign-order tokens",
+        guard.pending_orders.len(),
+        guard.foreign_order_tokens.len()
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

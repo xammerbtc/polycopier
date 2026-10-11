@@ -228,9 +228,10 @@ pub type HoldsQuery =
 /// Production implementation — makes a live Polymarket Data API call with a
 /// 5-second timeout.
 pub fn make_live_holds_query() -> HoldsQuery {
-    Arc::new(|wallet: String, token_id: String| {
+    let client = DataClient::default();
+    Arc::new(move |wallet: String, token_id: String| {
+        let client = client.clone();
         Box::pin(async move {
-            let client = DataClient::default();
             let Ok(addr) = Address::from_str(&wallet) else {
                 return None;
             };
@@ -275,9 +276,10 @@ pub type EndDateQuery = Arc<
 >;
 
 pub fn make_live_end_date_query() -> EndDateQuery {
-    Arc::new(|token_id: String| {
+    let client = polymarket_client_sdk::gamma::Client::default();
+    Arc::new(move |token_id: String| {
+        let client = client.clone();
         Box::pin(async move {
-            let client = polymarket_client_sdk::gamma::Client::default();
             let Ok(u) = polymarket_client_sdk::types::U256::from_str(&token_id) else {
                 return None;
             };
@@ -287,11 +289,18 @@ pub fn make_live_end_date_query() -> EndDateQuery {
             match tokio::time::timeout(Duration::from_secs(5), client.markets(&req)).await {
                 Ok(Ok(markets)) => markets.into_iter().next().and_then(|m| m.end_date),
                 Ok(Err(e)) => {
-                    warn!("Live end_date query failed for {}: {}", &token_id[..10], e);
+                    warn!(
+                        "Live end_date query failed for {}: {}",
+                        &token_id[..token_id.len().min(10)],
+                        e
+                    );
                     None
                 }
                 Err(_) => {
-                    warn!("Live end_date query timed out for {}", &token_id[..10]);
+                    warn!(
+                        "Live end_date query timed out for {}",
+                        &token_id[..token_id.len().min(10)]
+                    );
                     None
                 }
             }
@@ -327,6 +336,9 @@ impl EndDateCache {
             return Some(*ed);
         }
         if let Some(ed) = query(token_id.to_string()).await {
+            if self.inner.len() >= 20000 {
+                self.inner.clear();
+            }
             self.inner.insert(token_id.to_string(), ed);
             return Some(ed);
         }
@@ -393,6 +405,17 @@ pub fn start_strategy_engine(
             }
 
             // 1. Is it a filled trade from the target wallet list?
+            if crate::execution_journal::active() {
+                let guard = state.read().await;
+                if crate::execution_journal::blocked()
+                    || guard.foreign_order_tokens.contains(&event.token_id)
+                {
+                    eval.validated = false;
+                    eval.reason = Some(
+                        "Uncertain execution or another bot's open order requires isolation".into(),
+                    );
+                }
+            }
             if !config.target_wallets.contains(&event.taker_address) {
                 eval.validated = false;
                 eval.reason = Some("Wallet mismatch".to_string());
@@ -435,7 +458,7 @@ pub fn start_strategy_engine(
             if eval.validated {
                 // Check market closing soon (before resolving holdings to save time if skipped)
                 if let Some(skip_mins) = config.ignore_closing_in_mins {
-                    if skip_mins > 0 {
+                    if skip_mins > 0 && event.side == TradeSide::BUY {
                         let ed = end_date_cache
                             .get_or_fetch(&event.token_id, &end_date_query)
                             .await;
@@ -452,6 +475,12 @@ pub fn start_strategy_engine(
                                 ));
                                 warn!("Trade skipped: {}", eval.reason.as_ref().unwrap());
                             }
+                        } else {
+                            eval.validated = false;
+                            eval.reason = Some(
+                                "Market end time unavailable; closing-time risk cannot be verified"
+                                    .into(),
+                            );
                         }
                     }
                 }
@@ -525,6 +554,16 @@ pub fn start_strategy_engine(
                     ledger.find_active_for_token(&event.token_id).cloned()
                 };
                 let already_in_token = ledger_entry.is_some();
+                let untracked_holding =
+                    live_we_hold || state.read().await.positions.contains_key(&event.token_id);
+                if crate::execution_journal::active() && !already_in_token && untracked_holding {
+                    state.write().await.push_evaluated_trade(EvaluatedTrade {
+                        original_event: event.clone(),
+                        validated: false,
+                        reason: Some("Wallet holding is outside this copier's ledger".into()),
+                    });
+                    continue;
+                }
 
                 let skip_reason: Option<String> = match event.side {
                     // ---- BUY -----------------------------------------------
@@ -830,8 +869,11 @@ pub fn start_strategy_engine(
                         crate::latency::dispatch(&latency_event);
                         match submitter_clone(order).await {
                             Ok(()) => {
+                                crate::latency::accepted(&latency_event);
                                 let mut ledger = ledger_clone.lock().await;
-                                if is_closing {
+                                if is_closing && !is_sim && crate::execution_journal::active() {
+                                    info!("Live SELL accepted; ledger and realized PnL await confirmed fills");
+                                } else if is_closing {
                                     ledger.record_close(&token_id_clone, &source_wallet_clone);
                                     info!(
                                         "Ledger: closed {} from {}",
@@ -911,6 +953,11 @@ pub fn start_strategy_engine(
                                 }
                             }
                             Err(e) => {
+                                if e.is::<crate::execution_journal::UncertainExecution>() {
+                                    state_clone.write().await.started = true;
+                                    tracing::error!("{e}; pending margin remains reserved");
+                                    return;
+                                }
                                 // Remove from pending on failure so the order can be retried.
                                 let mut guard = state_clone.write().await;
                                 guard.pending_orders.remove(&token_id_clone);

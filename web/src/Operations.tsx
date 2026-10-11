@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import './Operations.css';
 
-export default function Operations() {
+export default function Operations({mode = 'simulation'}: {mode?: string}) {
   const [entries, setEntries] = useState<any[]>([]);
   const [lines, setLines] = useState<string[]>([]);
   const [wallet, setWallet] = useState('');
@@ -14,7 +14,7 @@ export default function Operations() {
       const response = await fetch('/api/redeem', {method:'POST'});
       if (!response.ok) throw new Error(await response.text());
       const result = await response.json();
-      setRedeemResult(`Paper redemption: ${result.settled.length} positions settled; ${result.lookup_failures.length} lookup failures. No on-chain transaction.`);
+      setRedeemResult(result.mode === 'simulation' ? `Paper redemption: ${result.settled.length} positions settled; ${result.lookup_failures.length} lookup failures. No on-chain transaction.` : `Live redemption: ${result.on_chain_transactions} confirmed transactions. Receipts are available from the redemption journal.`);
     } catch (error) { setRedeemResult(String(error)); }
     finally { setRedeeming(false); }
   }
@@ -32,7 +32,8 @@ export default function Operations() {
       <input placeholder="Filter source wallet" value={wallet} onChange={e => setWallet(e.target.value)} />
       <input type="date" value={date} onChange={e => setDate(e.target.value)} />
       <a href="/api/config" download="config.json">Export config</a><a href="/api/ledger" download="ledger.json">Export ledger</a>
-      <button disabled={redeeming} onClick={redeem} title="Settle resolved paper positions using verified winner flags">{redeeming ? 'Checking resolution…' : 'Force Redeem (paper)'}</button>
+      <a href="/api/redemption" download="redemption.json">Redemption journal</a>
+      <button disabled={redeeming} onClick={redeem} title="Redeem resolved copier positions; live execution requires configured Relayer credentials">{redeeming ? 'Checking resolution…' : `Force Redeem (${mode === 'simulation' ? 'paper' : 'live'})`}</button>
     </div>
     {redeemResult && <p role="status">{redeemResult}</p>}
     <div className="table-container"><table><thead><tr><th>Time (UTC)</th><th>Source wallet</th><th>Token</th><th>Entry</th><th>Size</th><th>Status</th></tr></thead><tbody>

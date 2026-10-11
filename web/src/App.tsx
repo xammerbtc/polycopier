@@ -147,7 +147,7 @@ function App() {
       {activeTab === 'dashboard' ? (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
           {/* Our Open Positions - FULL WIDTH */}
-          <Operations />
+          <Operations mode={state.mode} />
           <div className="glass-panel">
             <div className="panel-header">
               {state.mode === 'simulation' ? 'Paper Positions' : 'Our Positions'}

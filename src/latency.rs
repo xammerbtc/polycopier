@@ -9,6 +9,11 @@ use std::{
 
 #[derive(Clone, Default, Serialize)]
 pub struct Metrics {
+    pub execution_mode: String,
+    pub order_acceptances: u64,
+    pub last_fill_to_accept_upper_bound_ms: Option<i64>,
+    pub last_receive_to_accept_ms: Option<u64>,
+    pub last_accept_source: Option<String>,
     pub websocket_target_events: u64,
     pub polling_target_events: u64,
     pub order_dispatches: u64,
@@ -46,7 +51,8 @@ pub fn dispatch(event: &TradeEvent) {
     let observation = RECEIVED
         .lock()
         .unwrap()
-        .remove(&crate::rtds::event_key(event));
+        .get(&crate::rtds::event_key(event))
+        .copied();
     let mut metrics = METRICS.lock().unwrap();
     metrics.order_dispatches += 1;
     metrics.last_receive_to_dispatch_ms =
@@ -58,7 +64,27 @@ pub fn dispatch(event: &TradeEvent) {
     tracing::info!("Order latency: source={:?} receive_to_dispatch_ms={:?} fill_to_dispatch_upper_bound_ms={:?}", metrics.last_source, metrics.last_receive_to_dispatch_ms, metrics.last_fill_to_dispatch_upper_bound_ms);
 }
 pub fn snapshot() -> Metrics {
-    METRICS.lock().unwrap().clone()
+    let mut metrics = METRICS.lock().unwrap().clone();
+    metrics.execution_mode = std::env::var("POLYCOPIER_MODE").unwrap_or_else(|_| "unknown".into());
+    metrics
+}
+pub fn accepted(event: &TradeEvent) {
+    let observation = RECEIVED
+        .lock()
+        .unwrap()
+        .remove(&crate::rtds::event_key(event));
+    let mut metrics = METRICS.lock().unwrap();
+    metrics.order_acceptances += 1;
+    metrics.last_accept_source = observation.map(|(_, source)| source.into());
+    metrics.last_receive_to_accept_ms =
+        observation.map(|(when, _)| when.elapsed().as_millis() as u64);
+    metrics.last_fill_to_accept_upper_bound_ms = observation
+        .map(|_| chrono::Utc::now().timestamp_millis() - event.timestamp.saturating_mul(1000));
+    tracing::info!(
+        "Order acceptance latency: source={:?}, fill_to_accept_upper_bound_ms={:?}",
+        metrics.last_accept_source,
+        metrics.last_fill_to_accept_upper_bound_ms
+    );
 }
 
 #[cfg(test)]
@@ -78,10 +104,15 @@ mod tests {
         };
         dispatch(&event);
         assert_eq!(snapshot().last_fill_to_dispatch_upper_bound_ms, None);
+        accepted(&event);
+        assert_eq!(snapshot().last_fill_to_accept_upper_bound_ms, None);
         receive(&event, "websocket");
         dispatch(&event);
         assert_eq!(snapshot().last_source.as_deref(), Some("websocket"));
         assert!(snapshot().last_fill_to_dispatch_upper_bound_ms.is_some());
         assert!(snapshot().last_receive_to_dispatch_ms.is_some());
+        accepted(&event);
+        assert_eq!(snapshot().last_accept_source.as_deref(), Some("websocket"));
+        assert!(snapshot().last_fill_to_accept_upper_bound_ms.is_some());
     }
 }

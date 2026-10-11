@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 pub struct BotState {
+    pub foreign_order_tokens: std::collections::HashSet<String>,
     pub risk_outcome_tx: Option<tokio::sync::mpsc::UnboundedSender<Decimal>>,
     pub positions: HashMap<String, Position>,
     pub position_prices: HashMap<String, Decimal>,
@@ -51,6 +52,7 @@ impl BotState {
         };
 
         Self {
+            foreign_order_tokens: std::collections::HashSet::new(),
             risk_outcome_tx: None,
             positions: HashMap::new(),
             position_prices: HashMap::new(),

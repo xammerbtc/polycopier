@@ -37,7 +37,7 @@ if destination.exists():
     print('Credential staging file already exists; preserved.')
 elif len(pairs) == 1:
     key, address = pairs.pop()
-    private_file(destination, f'PRIVATE_KEY={key}\nFUNDER_ADDRESS={address}\n')
+    private_file(destination, f'PRIVATE_KEY={key}\nFUNDER_ADDRESS={address}\nCLOB_SIGNATURE_TYPE=2\n')
     print('Credential pair transferred locally on VPS; root-only staging file, not loaded by preview service.')
 else:
     print(f'Credential transfer needs source selection: {len(pairs)} distinct valid live wallet pairs. No credentials copied.')

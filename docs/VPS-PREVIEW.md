@@ -93,7 +93,9 @@ All paths except `/health` require Basic authentication.
 | GET | `/api/ledger` | Copy history and ledger export |
 | GET | `/api/logs` | Last 200 file-log lines |
 | GET | `/api/metrics` | Target-stream counters and last order latency observations |
-| POST | `/api/redeem` | Settle resolved paper positions; no on-chain transactions |
+| POST | `/api/redeem` | Settle paper positions, or explicitly enabled live redemption through the official SDK |
+| GET | `/api/redemption` | Live credential status and nonsecret redemption journal |
+| GET | `/api/executions` | Copier order IDs and durable submission intents |
 | POST | `/api/action/restart` | Replace only the polycopier process, preserving CLI simulation flags |
 
 The secret-writing `/api/env` POST is disabled. Credential changes belong in a
@@ -101,14 +103,53 @@ secure server-side workflow. Force Redeem in preview verifies a closed binary
 market with exactly one winner through Gamma/CLOB, credits paper payout, persists
 state, and closes ledger records. Lookup failures and ambiguous resolutions leave
 positions unchanged. Repeated requests cannot pay out a removed position twice.
-Live redemption returns HTTP 422 until a verified Safe/Relayer integration exists.
-This preview never submits an on-chain redemption.
+This preview never submits an on-chain redemption. The live SDK bridge uses
+`@polymarket/client` 0.13.0 with viem 2.57.4 and an isolated, pinned Node 24
+runtime installed by `deploy/install-redeemer.sh`. It supports the wallet and
+protocol routes selected by the official SDK. It only calls redemption; it does
+not create approvals, transfer funds elsewhere, or place orders.
+
+Live Redeem requires live execution mode, `LIVE_REDEEM_ENABLED=true`, the signer
+and funder, and `POLYMARKET_RELAYER_API_KEY` plus
+`POLYMARKET_RELAYER_API_KEY_ADDRESS`. Keep these in a root-only environment file
+consumed by systemd; never paste values into chat or commits. The Relayer key is
+distinct from a CLOB API key. The donor credentials currently provide the
+signer/funder only. Do not enable live without resolving shared-wallet order
+ownership and signature-type compatibility.
+
+The endpoint selects resolved holdings present in this copier's active ledger,
+serializes requests, and persists intent before SDK submission. It waits for a
+confirmed transaction hash before closing ledger records. An uncertain result
+leaves `pending_reconciliation` in `redemption-journal.json` and blocks automatic
+retry. Reconcile using the wallet's on-chain/Relayer history before any manual
+change to that journal; deleting pending intent is not an idempotency mechanism.
+Live execution remains unverified until credentials and on-chain preflight are
+available. SDK mock tests prove call routing and confirmation/error handling,
+not a successful live redemption.
+
+Live CLOB startup preserves all wallet orders. Exact CLOB order IDs registered
+in `execution-journal.json` are the only orders the copier watcher may cancel.
+Tokens with another bot's open orders and holdings outside this copier's ledger
+are excluded from execution. Intent is persisted before submitting a signed
+order. Ambiguous network/persistence outcomes pause execution and block live
+startup or resume until reconciled; reserved margin is not blindly refunded.
+The donor is a Gnosis Safe: use `CLOB_SIGNATURE_TYPE=2` in its staging environment.
+`0/eoa`, `1/proxy`, and `2/safe` are explicit supported selections.
+
+After a successful build, root can run `target/release/live_preflight
+/opt/polycopier/.env.credentials` to check CLOB authentication, the balance
+endpoint, and reported IP trading availability. It does not submit, cancel, or
+redeem orders and never prints credentials. This check does not certify live
+order fills, approvals, gasless redemption, or a separate funded account.
 
 Metrics distinguish websocket and polling observations. Fill timestamps have
 one-second precision, so fill-to-dispatch is reported as an upper bound, while
 receive-to-dispatch uses a monotonic clock. These are dispatch observations,
 not confirmation of a live order accepted by the exchange. A null fill-latency
 field means the latest dispatch has no matching observed target fill.
+Acceptance metrics cover the submitter's completed acknowledgement, include
+SDK preparation time, and carry `execution_mode`; paper acknowledgements are
+not live exchange acceptances. HTTP clients are reused between metadata queries.
 Synthetic catch-up and position-sweep orders are counted as dispatches but have
 null fill-latency fields; their generated timestamps cannot prove RTDS latency.
 
@@ -144,3 +185,7 @@ restarts `polycopier-preview`; retain current ledgers and snapshots. Stop only
 the new service if verification fails. Do not restart the existing trading bot.
 
 Live trading has not been enabled or certified by this preview deployment.
+Live SELL acceptance keeps the ledger open and does not book realized profit.
+Confirmed fill and fee reconciliation remains required before enabling live
+trading; wallet position refresh alone cannot establish execution prices or
+attribute concurrent trades by other bots using the same wallet.

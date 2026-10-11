@@ -8,4 +8,6 @@ echo frontend > build.phase
 cd web
 npm ci
 npm run build
-echo complete > ../build.phase
+cd ..
+if test -f deploy/redeemer/package.json; then bash deploy/install-redeemer.sh; fi
+echo complete > build.phase

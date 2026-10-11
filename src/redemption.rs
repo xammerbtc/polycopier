@@ -62,7 +62,7 @@ pub async fn resolved_payout(
     };
     anyhow::ensure!(
         condition.starts_with("0x")
-            && condition.len() == 66
+            && matches!(condition.len(), 64 | 66)
             && condition[2..].chars().all(|c| c.is_ascii_hexdigit()),
         "Invalid condition ID"
     );

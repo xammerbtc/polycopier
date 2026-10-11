@@ -1619,6 +1619,51 @@ mod strategy_engine_tests {
         assert_eq!(guard.realized_pnl, dec!(20) * dec!(0.09) - fee);
     }
 
+    #[tokio::test]
+    async fn enabled_closing_time_guard_rejects_missing_market_metadata() {
+        let mut config = test_config();
+        config.ignore_closing_in_mins = Some(20);
+        let mut initial = BotState::new(false, None);
+        initial.total_balance = dec!(100);
+        let state = Arc::new(RwLock::new(initial));
+        let log = Arc::new(Mutex::new(vec![]));
+        let (tx, rx) = mpsc::channel(10);
+        start_strategy_engine(
+            rx,
+            state.clone(),
+            RiskEngine::new(config.clone()),
+            mock_submitter(log.clone()),
+            config,
+            test_ledger(),
+            make_no_op_holds_query(),
+            make_no_op_end_date_query(),
+        );
+        tx.send(make_trade("0xabc", dec!(0.5), dec!(20), TradeSide::BUY))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.read().await.trades_skipped > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(log.lock().unwrap().is_empty());
+        assert!(state
+            .read()
+            .await
+            .live_feed
+            .front()
+            .unwrap()
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("end time unavailable"));
+    }
+
     /// A SELL from a DIFFERENT target wallet (not the one we copied from) is
     /// ignored — we keep holding for the target we actually copied from.
     #[tokio::test]

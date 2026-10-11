@@ -28,9 +28,19 @@ use polymarket_client_sdk::auth::Normal;
 
 pub type AuthedClobClient = ClobClient<Authenticated<Normal>>;
 
+pub fn signature_type(value: &str) -> Result<SignatureType> {
+    match value.to_lowercase().as_str() {
+        "0" | "eoa" => Ok(SignatureType::Eoa),
+        "1" | "proxy" => Ok(SignatureType::Proxy),
+        "2" | "safe" | "gnosis_safe" => Ok(SignatureType::GnosisSafe),
+        _ => bail!("CLOB_SIGNATURE_TYPE must be eoa/0, proxy/1 or safe/2"),
+    }
+}
+
 pub async fn build_order_submitter(
     config: &Config,
 ) -> Result<(OrderSubmitter, BalanceFetcher, AuthedClobClient)> {
+    crate::execution_journal::initialize()?;
     let signer = LocalSigner::from_str(&config.private_key)?.with_chain_id(Some(config.chain_id));
     let funder = Address::from_str(&config.funder_address)?;
 
@@ -38,7 +48,9 @@ pub async fn build_order_submitter(
     let clob = ClobClient::new("https://clob.polymarket.com", ClobConfig::default())?
         .authentication_builder(&signer)
         .funder(funder)
-        .signature_type(SignatureType::Proxy) // Magic/email wallet; use GnosisSafe for browser wallet
+        .signature_type(signature_type(
+            &std::env::var("CLOB_SIGNATURE_TYPE").unwrap_or_else(|_| "proxy".into()),
+        )?)
         .authenticate()
         .await?;
 
@@ -89,12 +101,17 @@ pub async fn build_order_submitter(
                 .await?;
 
             let signed_order = clob.sign(&signer, order_req).await?;
+            let intent = crate::execution_journal::begin(&order)?;
 
             match clob.post_order(signed_order).await {
                 Ok(res) => {
                     // The CLOB returns HTTP 200 even for rejected orders.
                     // We must check res.success and res.error_msg explicitly.
                     if !res.success {
+                        if crate::execution_journal::finish(&intent, "rejected", None).is_err() {
+                            crate::execution_journal::uncertain(&intent);
+                            return Err(crate::execution_journal::UncertainExecution.into());
+                        }
                         let msg = res.error_msg.as_deref().unwrap_or("(no message)");
                         tracing::warn!(
                             "Order rejected by CLOB: error_msg={:?}, status={:?}, \
@@ -125,11 +142,19 @@ pub async fn build_order_submitter(
                         res.making_amount,
                         res.taking_amount
                     );
+                    if res.order_id.is_empty()
+                        || crate::execution_journal::finish(&intent, "accepted", Some(res.order_id))
+                            .is_err()
+                    {
+                        crate::execution_journal::uncertain(&intent);
+                        return Err(crate::execution_journal::UncertainExecution.into());
+                    }
                     Ok(())
                 }
                 Err(e) => {
                     tracing::error!("API Execution Failed: {}", e);
-                    bail!("Failed to execute limit order: {}", e)
+                    crate::execution_journal::uncertain(&intent);
+                    Err(crate::execution_journal::UncertainExecution.into())
                 }
             }
         })

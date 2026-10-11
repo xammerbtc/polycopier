@@ -4,8 +4,10 @@ pub mod clients;
 pub mod config;
 pub mod copied_counter;
 pub mod copy_ledger;
+pub mod execution_journal;
 pub mod latency;
 pub mod listener;
+pub mod live_redemption;
 pub mod log_capture;
 pub mod models;
 pub mod order_watcher;
@@ -248,8 +250,8 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
-    // Wrap RiskEngine in Arc<Mutex<>> so both strategy engine and order watcher
-    // can reference it — order watcher calls record_loss() on loss-triggered cancels.
+    // Legacy watcher argument retained for API compatibility. Real outcomes are
+    // delivered to the strategy's authoritative risk engine through BotState.
     let risk_engine = Arc::new(Mutex::new(risk::RiskEngine::new(config.clone())));
 
     let (poly_submitter, balance_fetcher, clob) = if config.is_sim {
@@ -297,7 +299,8 @@ async fn main() -> anyhow::Result<()> {
     // and already-queued state — preventing duplicate orders on restart.
     if !config.is_sim {
         wallet_sync::seed_own_positions(&config.funder_address, state.clone()).await;
-        wallet_sync::seed_pending_orders(clob.as_ref().expect("live client"), state.clone()).await;
+        wallet_sync::seed_pending_orders(clob.as_ref().expect("live client"), state.clone())
+            .await?;
     }
 
     // Reconcile the copy ledger against our live wallet positions.

@@ -45,6 +45,18 @@ rust-audit.json
 rust-audit.exit
 rust-audit.err
 preview-update.tar
+redemption-journal.json
+execution-journal.json
+deploy/redeemer/package/
+deploy/redeemer/node_modules/
+ownership-update.tar
+ownership-final.tar
+deploy/redeemer/*.tgz
+runtime/
 .agents/
 
 src/bin/order_test.rs
+
+release-final-20261011.tar
+
+durable-journal-20261011.tar
