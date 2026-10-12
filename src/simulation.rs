@@ -5,6 +5,8 @@ use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
+    #[serde(default)]
+    processed_signals: HashMap<String, i64>,
     positions: HashMap<String, Position>,
     total_balance: Decimal,
     realized_pnl: Decimal,
@@ -17,6 +19,7 @@ pub fn restore(state: &mut BotState) -> anyhow::Result<()> {
     match std::fs::read_to_string("simulation_state.json") {
         Ok(raw) => {
             let s: Snapshot = serde_json::from_str(&raw)?;
+            state.paper_processed_signals = s.processed_signals;
             state.positions = s.positions;
             state.total_balance = s.total_balance;
             state.realized_pnl = s.realized_pnl;
@@ -31,6 +34,7 @@ pub fn restore(state: &mut BotState) -> anyhow::Result<()> {
 }
 pub fn save(state: &BotState) -> anyhow::Result<()> {
     let s = Snapshot {
+        processed_signals: state.paper_processed_signals.clone(),
         positions: state.positions.clone(),
         total_balance: state.total_balance,
         realized_pnl: state.realized_pnl,
@@ -127,6 +131,7 @@ mod tests {
         assert_eq!(state.positions["token"].size, d("1"));
         assert_eq!(state.realized_pnl, d("-0.234"));
         let snapshot = Snapshot {
+            processed_signals: state.paper_processed_signals.clone(),
             positions: state.positions.clone(),
             total_balance: state.total_balance,
             realized_pnl: state.realized_pnl,
@@ -150,6 +155,16 @@ mod tests {
         assert_eq!(state.paper_outcomes[0].1, d("-0.158"));
         assert!(sell(&mut state, "token", d("1"), d("0.7"), Decimal::ZERO).is_err());
     }
+    #[test]
+    fn committed_signal_keys_roundtrip_with_inventory() {
+        let raw = r#"{"positions":{},"total_balance":"10000","realized_pnl":"0","processed_signals":{"fill-key":123}}"#;
+        let snapshot: Snapshot = serde_json::from_str(raw).unwrap();
+        let restored: Snapshot =
+            serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert_eq!(restored.processed_signals["fill-key"], 123);
+        assert_eq!(restored.total_balance, d("10000"));
+    }
+
     #[test]
     fn legacy_snapshot_and_oversell_are_safe() {
         let legacy: Snapshot =

@@ -4,8 +4,8 @@ use crate::models::{TradeEvent, TradeSide};
 use alloy::primitives::Address;
 use anyhow::Result;
 use chrono::Utc;
-use polymarket_client_sdk::data::types::request::TradesRequest;
-use polymarket_client_sdk::data::Client as DataClient;
+use polymarket_client_sdk::data::types::request::ActivityRequest;
+use polymarket_client_sdk::data::types::{ActivitySortBy, ActivityType, SortDirection};
 use std::collections::{HashSet, VecDeque};
 use std::str::FromStr;
 use tokio::sync::mpsc;
@@ -18,7 +18,13 @@ pub static ACTIVE_TARGETS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::n
 
 pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) -> Result<()> {
     let mut config = config.clone();
-    let data_client = DataClient::default();
+    let data_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(5))
+        .tcp_nodelay(true)
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .pool_idle_timeout(std::time::Duration::from_secs(60))
+        .build()?;
 
     tokio::spawn(async move {
         info!("Started polling target wallets");
@@ -57,7 +63,7 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
                                 Utc::now().timestamp() as u64,
                                 std::sync::atomic::Ordering::Relaxed,
                             );
-                            // Success — backoff reset happens after the full loop
+                            // Success Р Р†Р вЂљРІР‚Сњ backoff reset happens after the full loop
                             t
                         }
                         Err(e) => {
@@ -127,10 +133,10 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
                     match tx.try_send(event) {
                         Ok(()) => evict_and_insert(&mut seen_hashes, &mut seen_order, hash),
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            warn!("Listener: strategy channel full — retrying event on next poll");
+                            warn!("Listener: strategy channel full Р Р†Р вЂљРІР‚Сњ retrying event on next poll");
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                            error!("Listener: strategy channel closed — shutting down listener.");
+                            error!("Listener: strategy channel closed Р Р†Р вЂљРІР‚Сњ shutting down listener.");
                             return;
                         }
                     }
@@ -157,12 +163,16 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
     Ok(())
 }
 
-const PAGE_SIZE: i32 = 500;
+const PAGE_SIZE: i32 = 100;
 
-fn page_request(wallet: Address, offset: i32) -> Result<TradesRequest> {
-    Ok(TradesRequest::builder()
+fn page_request(wallet: Address, offset: i32, start: i64, end: i64) -> Result<ActivityRequest> {
+    Ok(ActivityRequest::builder()
         .user(wallet)
-        .taker_only(false)
+        .activity_types(vec![ActivityType::Trade])
+        .start(start.max(0) as u64)
+        .end(end.max(0) as u64)
+        .sort_by(ActivitySortBy::Timestamp)
+        .sort_direction(SortDirection::Desc)
         .limit(PAGE_SIZE)?
         .offset(offset)?
         .build())
@@ -172,18 +182,30 @@ fn more_pages(count: usize, oldest: Option<i64>, cutoff: i64) -> bool {
     count == PAGE_SIZE as usize && oldest.is_some_and(|timestamp| timestamp >= cutoff)
 }
 
+// Use recognized time filters: an arbitrary cache-buster on /trades did not
+// reliably bypass upstream snapshots. The window stays fixed across pages.
+fn fresh_request(client: &reqwest::Client, request: &ActivityRequest) -> reqwest::RequestBuilder {
+    client
+        .get("https://data-api.polymarket.com/activity")
+        .query(request)
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+}
+
 async fn fetch_recent(
-    client: &DataClient,
+    client: &reqwest::Client,
     wallet: Address,
     cutoff: i64,
 ) -> Result<Vec<polymarket_client_sdk::data::types::response::Trade>> {
     let mut trades = Vec::new();
+    let end = Utc::now().timestamp();
     for offset in (0..=10000).step_by(PAGE_SIZE as usize) {
-        let page = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            client.trades(&page_request(wallet, offset)?),
-        )
-        .await??;
+        let page: Vec<polymarket_client_sdk::data::types::response::Trade> =
+            fresh_request(client, &page_request(wallet, offset, cutoff, end)?)
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
         let more = more_pages(
             page.len(),
             page.iter().map(|trade| trade.timestamp).min(),
@@ -217,18 +239,48 @@ mod pagination_tests {
     use super::*;
 
     #[test]
-    fn request_includes_maker_fills_and_offset() {
-        let value = serde_json::to_value(page_request(Address::ZERO, 500).unwrap()).unwrap();
-        assert_eq!(value["takerOnly"], false);
-        assert_eq!(value["limit"], 500);
-        assert_eq!(value["offset"], 500);
+    fn request_includes_all_trade_activity_and_window() {
+        let value =
+            serde_json::to_value(page_request(Address::ZERO, 100, 700, 1000).unwrap()).unwrap();
+        assert_eq!(value["type"], "TRADE");
+        assert!(value.get("takerOnly").is_none());
+        assert_eq!(value["limit"], 100);
+        assert_eq!(value["offset"], 100);
+        assert_eq!(value["start"], 700);
+        assert_eq!(value["end"], 1000);
+        assert_eq!(value["sortBy"], "TIMESTAMP");
+        assert_eq!(value["sortDirection"], "DESC");
+    }
+
+    #[test]
+    fn polling_windows_use_recognized_time_filters() {
+        let client = reqwest::Client::new();
+        let first = fresh_request(
+            &client,
+            &page_request(Address::ZERO, 100, 700, 1000).unwrap(),
+        )
+        .build()
+        .unwrap();
+        let next = fresh_request(
+            &client,
+            &page_request(Address::ZERO, 100, 1700, 2000).unwrap(),
+        )
+        .build()
+        .unwrap();
+        assert_ne!(first.url(), next.url());
+        let params: std::collections::HashMap<_, _> = next.url().query_pairs().collect();
+        assert_eq!(params["type"], "TRADE");
+        assert_eq!(params["offset"], "100");
+        assert_eq!(params["start"], "1700");
+        assert_eq!(params["end"], "2000");
+        assert_eq!(next.headers()[reqwest::header::CACHE_CONTROL], "no-cache");
     }
 
     #[test]
     fn full_page_at_cutoff_keeps_same_second_fills() {
-        assert!(more_pages(500, Some(100), 100));
-        assert!(!more_pages(500, Some(99), 100));
-        assert!(!more_pages(499, Some(101), 100));
+        assert!(more_pages(100, Some(100), 100));
+        assert!(!more_pages(100, Some(99), 100));
+        assert!(!more_pages(99, Some(101), 100));
         assert!(!more_pages(0, None, 100));
     }
 }

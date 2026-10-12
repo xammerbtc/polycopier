@@ -357,8 +357,8 @@ seeded into this empty account. A SELL without copier inventory is skipped.
 Order share quantities retain the existing two-decimal truncation, and buys
 still require enough paper cash including fees.
 
-RTDS remains primary. A reused SDK HTTP client polls every second (skipping
-missed ticks), explicitly includes maker and taker trades and paginates 500-fill
+RTDS remains primary. A reused HTTP client polls every second (skipping
+missed ticks), explicitly includes maker and taker trades and paginates 100-fill
 pages through the last five minutes. Each page has a five-second timeout;
 errors retain backoff. Offset exhaustion is logged and counted, not presented
 as complete coverage. Pages are sorted before dispatch; overlapping polls and
@@ -376,3 +376,24 @@ pre-execution count, not a count of fills. Distinct same-token fills remain
 separate in the feed. The new profile accepts fallback signals up to 300 seconds
 old; paper prices still model instant fills at the strategy limit price, so this
 experiment does not measure real execution liquidity or achievable live latency.
+
+
+The live observation found a fixed Data API URL serving a snapshot over ten
+minutes older than RTDS. A cache-distinct query returned the latest fills.
+A subsequent check showed arbitrary cache-busters were insufficient. Fallback
+now reads /activity with type=TRADE, explicit start/end timestamps and descending
+time order, using 100-row pages. These recognized filters form a moving
+five-minute window; its endpoints stay fixed across pages. It includes maker
+and taker activity and avoids repeatedly downloading old history. Tests verify
+the serialized filters and page boundary behavior. The client keeps pooled HTTP
+connections and no-cache. Upstream indexing delay remains possible.
+
+
+Paper snapshots now save recent committed source fill keys alongside inventory
+and cash, preventing a restored five-minute fallback window from applying those
+fills again. Keys are retained for ten minutes, exceeding the replay window.
+The upgrade script pauses submissions, drains pending orders, requires the
+recent feed to account for every accepted fill in the old runtime, then backs
+up and seeds those keys into the stopped snapshot before starting the new binary.
+If the feed cannot prove coverage, it resumes the old runtime and aborts instead
+of risking a replay. The experiment start, book and configuration are preserved.

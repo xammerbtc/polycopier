@@ -53,6 +53,11 @@ async fn every_paper_fill_scales_shares_and_preserves_aggregate_basis() {
     tx.send(make_trade("0xabc", dec!(0.50), dec!(20), TradeSide::BUY))
         .await
         .unwrap();
+    // A replay of the first signal waits for its pending fill and then sees
+    // the committed key, just as a recovered snapshot does after restart.
+    tx.send(make_trade("0xabc", dec!(0.50), dec!(20), TradeSide::BUY))
+        .await
+        .unwrap();
     tx.send(artificial).await.unwrap();
     for (size, side) in [
         (dec!(10), TradeSide::BUY),

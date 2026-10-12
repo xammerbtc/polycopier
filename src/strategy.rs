@@ -52,7 +52,7 @@ pub fn calculate_entry_size(size: Decimal, price: Decimal, max_trade_usd: Decima
 /// Any order with size < 5 shares gets a 400: "Size (X) lower than the minimum: 5"
 pub const MIN_ORDER_SHARES: Decimal = Decimal::from_parts(5, 0, 0, false, 0);
 
-/// Dollar floor (secondary sanity guard — the real constraint is MIN_ORDER_SHARES).
+/// Dollar floor (secondary sanity guard Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the real constraint is MIN_ORDER_SHARES).
 pub const MIN_ORDER_USD: Decimal = Decimal::from_parts(1, 0, 0, false, 0);
 
 /// Compute the USD budget for a single BUY order according to the active [`SizingMode`].
@@ -65,7 +65,7 @@ pub const MIN_ORDER_USD: Decimal = Decimal::from_parts(1, 0, 0, false, 0);
 ///
 /// Returns **`Decimal::ZERO`** when the computed budget is below `MIN_ORDER_USD` ($1).
 /// Callers treat zero as "skip this order". This respects the user's configured
-/// percentage exactly: 7% of $39 = $2.73 ≥ $1 → order placed correctly.
+/// percentage exactly: 7% of $39 = $2.73 Р В Р вЂ Р Р†Р вЂљР’В°Р СћРЎвЂ™ $1 Р В Р вЂ Р Р†Р вЂљР’В Р Р†Р вЂљРІвЂћСћ order placed correctly.
 pub fn compute_order_usd(
     our_balance: Decimal,
     sizing_mode: &SizingMode,
@@ -95,7 +95,7 @@ pub fn compute_order_usd(
     };
     let capped = desired.min(max_trade_usd);
     // Return ZERO to signal "skip" when below the CLOB minimum.
-    // Never floor UP — that silently overrides the user's sizing config.
+    // Never floor UP Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ that silently overrides the user's sizing config.
     if capped < MIN_ORDER_USD {
         Decimal::ZERO
     } else {
@@ -108,7 +108,7 @@ pub fn compute_order_usd(
 // ---------------------------------------------------------------------------
 
 /// Maximum number of entries the debounce cache may hold simultaneously.
-/// At ~3 events/s per target × 4 targets, 512 covers >40 seconds of burst.
+/// At ~3 events/s per target Р В РІР‚СљР Р†Р вЂљРІР‚Сњ 4 targets, 512 covers >40 seconds of burst.
 const DEBOUNCE_CACHE_CAP: usize = 512;
 /// Entries older than this are evicted unconditionally.
 const DEBOUNCE_STALE_SECS: u64 = 5;
@@ -138,7 +138,7 @@ impl DebounceCache {
         // Evict stale entries before checking capacity
         self.purge_stale();
 
-        // Enforce capacity ceiling — evict oldest entry if at cap
+        // Enforce capacity ceiling Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ evict oldest entry if at cap
         if self.map.len() >= DEBOUNCE_CACHE_CAP && !self.map.contains_key(&key) {
             // Remove the entry with the oldest insertion time
             if let Some(oldest_key) = self
@@ -154,7 +154,7 @@ impl DebounceCache {
         if let Some((existing, inserted)) = self.map.get_mut(&key) {
             let age_secs = chrono::Utc::now().timestamp() - existing.timestamp;
             if age_secs < DEBOUNCE_WINDOW_SECS {
-                // Accumulate size — still within the debounce window
+                // Accumulate size Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ still within the debounce window
                 existing.size += event.size;
                 debug!(
                     "Debounced fragmented fill for {}. New size: {}",
@@ -162,7 +162,7 @@ impl DebounceCache {
                 );
                 return true; // caller should `continue`
             } else {
-                // Window expired — replace with fresh event
+                // Window expired Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ replace with fresh event
                 *existing = event;
                 *inserted = Instant::now();
                 return false;
@@ -229,7 +229,7 @@ impl LiveQueryCache {
 pub type HoldsQuery =
     Arc<dyn Fn(String, String) -> Pin<Box<dyn Future<Output = Option<bool>> + Send>> + Send + Sync>;
 
-/// Production implementation — makes a live Polymarket Data API call with a
+/// Production implementation Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ makes a live Polymarket Data API call with a
 /// 5-second timeout.
 pub fn make_live_holds_query() -> HoldsQuery {
     let client = DataClient::default();
@@ -465,6 +465,15 @@ pub fn start_strategy_engine_with_fees(
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
+            if config.is_sim
+                && state
+                    .read()
+                    .await
+                    .paper_processed_signals
+                    .contains_key(&crate::rtds::event_key(&event))
+            {
+                continue; // A committed paper fill must not execute again after reconnect/restart.
+            }
             risk_engine.update_config(config.clone());
             reconcile_risk(&mut risk_engine, &state, config.is_sim).await;
             event_count += 1;
@@ -510,7 +519,7 @@ pub fn start_strategy_engine_with_fees(
                 eval.reason = Some("Wallet mismatch".to_string());
             }
 
-            // 2. Fragmented fill debounce (Gap 5 — bounded cache with TTL eviction)
+            // 2. Fragmented fill debounce (Gap 5 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ bounded cache with TTL eviction)
             let cache_key = format!(
                 "{}_{}_{:?}",
                 event.taker_address, event.token_id, event.side
@@ -519,7 +528,7 @@ pub fn start_strategy_engine_with_fees(
                 && !proportional_paper
                 && debounce.insert_or_accumulate(cache_key, event.clone())
             {
-                continue; // accumulated — skip this event
+                continue; // accumulated Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ skip this event
             }
 
             // 3. Risk bounds
@@ -540,7 +549,7 @@ pub fn start_strategy_engine_with_fees(
             //   a close.  A SELL from a different target is irrelevant to our
             //   position.
             //
-            //   LIVE VERIFICATION (Gap 13 — cached): for BUY events we query the
+            //   LIVE VERIFICATION (Gap 13 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ cached): for BUY events we query the
             //   target's wallet live; for SELL events we query OUR wallet live.
             //   Results are cached for LIVE_QUERY_CACHE_TTL_SECS seconds to reduce
             //   API calls and latency for burst activity.
@@ -604,7 +613,7 @@ pub fn start_strategy_engine_with_fees(
                 let (live_we_hold, live_target_holds) = if our_cached.is_some()
                     && target_cached.is_some()
                 {
-                    // Both are cached — no API call needed
+                    // Both are cached Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ no API call needed
                     (
                         our_cached.unwrap_or(cache_we_hold),
                         target_cached.unwrap_or(cache_target_holds),
@@ -682,7 +691,7 @@ pub fn start_strategy_engine_with_fees(
                                     .to_string(),
                             )
                         } else {
-                            None // Fresh long entry → copy
+                            None // Fresh long entry Р В Р вЂ Р Р†Р вЂљР’В Р Р†Р вЂљРІвЂћСћ copy
                         }
                     }
                     // ---- SELL ----------------------------------------------
@@ -690,17 +699,17 @@ pub fn start_strategy_engine_with_fees(
                         if live_we_hold {
                             match &ledger_entry {
                                 Some(entry) if entry.source_wallet == event.taker_address => {
-                                    None // Correct source is selling → close
+                                    None // Correct source is selling Р В Р вЂ Р Р†Р вЂљР’В Р Р†Р вЂљРІвЂћСћ close
                                 }
                                 Some(entry) => Some(format!(
-                                    "SELL skipped: {} sold but we copied from {} — \
+                                    "SELL skipped: {} sold but we copied from {} Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ \
                                      keeping position",
                                     &event.taker_address[..event.taker_address.len().min(10)],
                                     &entry.source_wallet[..entry.source_wallet.len().min(10)],
                                 )),
                                 None => {
                                     warn!(
-                                        "SELL: we hold token {} with no ledger entry — \
+                                        "SELL: we hold token {} with no ledger entry Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ \
                                          closing defensively.",
                                         &event.token_id[..event.token_id.len().min(12)]
                                     );
@@ -710,7 +719,7 @@ pub fn start_strategy_engine_with_fees(
                         } else if let Some(entry) = &ledger_entry {
                             warn!(
                                 "SELL: ledger shows active copy of {} from {} but we no longer \
-                                 hold it — marking closed.",
+                                 hold it Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ marking closed.",
                                 &event.token_id[..event.token_id.len().min(12)],
                                 &entry.source_wallet[..entry.source_wallet.len().min(10)],
                             );
@@ -848,7 +857,7 @@ pub fn start_strategy_engine_with_fees(
                     };
                     let truncated_size = desired.trunc_with_scale(2);
                     if truncated_size <= rust_decimal::Decimal::ZERO {
-                        let msg = format!("Dust fractional balance {:.4} truncates to 0.00 — skipping limit order logic.", our_held_size);
+                        let msg = format!("Dust fractional balance {:.4} truncates to 0.00 Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ skipping limit order logic.", our_held_size);
                         tracing::warn!("{}", msg);
                         let mut guard = state.write().await;
                         guard
@@ -1062,6 +1071,7 @@ pub fn start_strategy_engine_with_fees(
                                 if is_sim {
                                     let mut guard = state_clone.write().await;
                                     let mut closed_outcome = None;
+                                    let mut accounted = true;
                                     if is_closing {
                                         let fee = crate::fees::taker_fee(
                                             order_size,
@@ -1093,6 +1103,7 @@ pub fn start_strategy_engine_with_fees(
                                             }
                                             Err(e) => {
                                                 guard.started = true;
+                                                accounted = false;
                                                 tracing::error!("Paper fill accounting failed; execution paused: {e}");
                                             }
                                         }
@@ -1149,6 +1160,16 @@ pub fn start_strategy_engine_with_fees(
                                             })
                                         })
                                         .sum();
+                                    if accounted {
+                                        let cutoff = chrono::Utc::now().timestamp() - 600;
+                                        guard
+                                            .paper_processed_signals
+                                            .retain(|_, timestamp| *timestamp >= cutoff);
+                                        guard.paper_processed_signals.insert(
+                                            crate::rtds::event_key(&latency_event),
+                                            latency_event.timestamp,
+                                        );
+                                    }
                                     let saved = if ledger.is_persistent() {
                                         crate::simulation::commit(&mut guard)
                                     } else {

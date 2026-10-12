@@ -27,8 +27,8 @@ assert health['websocket_connected']
 assert time.time() - health['last_poll_success'] < 15
 start = int(datetime.datetime.fromisoformat(report['started_at_utc']).timestamp())
 wallet = cfg['targets']['wallets'][0].split(':')[0]
-query = urllib.parse.urlencode({'user': wallet, 'takerOnly': 'false', 'limit': 1000})
-public = json.loads(subprocess.check_output(['curl', '--fail', '--silent', '--show-error', '--max-time', '15', 'https://data-api.polymarket.com/trades?' + query], text=True))
+query = urllib.parse.urlencode({'user': wallet, 'type': 'TRADE', 'limit': 500, 'start': max(start, int(time.time())-280), 'end': int(time.time()), 'sortBy': 'TIMESTAMP', 'sortDirection': 'DESC'})
+public = json.loads(subprocess.check_output(['curl', '--fail', '--silent', '--show-error', '--max-time', '15', 'https://data-api.polymarket.com/activity?' + query], text=True))
 # Allow ten seconds for propagation and observation; only compare the recoverable window.
 cutoff = max(start, int(time.time()) - 280)
 public = [t for t in public if cutoff <= t['timestamp'] <= time.time() - 10]
@@ -37,6 +37,10 @@ def key(t, remote=False):
     return (t['transactionHash' if remote else 'transaction_hash'].lower(),
             str(t['asset' if remote else 'token_id']), t['side'])
 observed = {key(e['original_event']) for e in feed}
+committed = json.loads((root / 'simulation_state.json').read_text()).get('processed_signals', {})
+for event_key in committed:
+    parts = event_key.split(':')
+    if len(parts) == 6: observed.add((parts[0], parts[2], parts[3]))
 missing = sorted({key(t, True) for t in public} - observed)
 summary = {'started_at_utc': report['started_at_utc'], 'opening_bank': report['opening_bank'],
            'balance': state['total_balance'], 'positions': len(state['positions']),

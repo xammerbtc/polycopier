@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 pub struct BotState {
+    pub paper_processed_signals: HashMap<String, i64>,
     /// Realized exits for each still-open paper position, carried into its final risk outcome.
     pub paper_cycle_pnl: HashMap<String, Decimal>,
     /// Completed paper cycles persisted with inventory before risk notification.
@@ -69,6 +70,7 @@ impl BotState {
         };
 
         Self {
+            paper_processed_signals: HashMap::new(),
             paper_cycle_pnl: HashMap::new(),
             paper_outcomes: Vec::new(),
             paper_committed_outcomes: 0,
