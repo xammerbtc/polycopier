@@ -1,0 +1,12 @@
+[Unit]
+Description=Check Polycopier disk usage every ten minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+RandomizedDelaySec=30s
+Persistent=true
+Unit=polycopier-storage-maintenance.service
+
+[Install]
+WantedBy=timers.target

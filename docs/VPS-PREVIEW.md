@@ -397,3 +397,46 @@ recent feed to account for every accepted fill in the old runtime, then backs
 up and seeds those keys into the stopped snapshot before starting the new binary.
 If the feed cannot prove coverage, it resumes the old runtime and aborts instead
 of risking a replay. The experiment start, book and configuration are preserved.
+
+
+## Bounded build storage and disk checks (2026-10-12)
+
+Repeated Rust test builds had left about 29 GiB of regenerated debug artifacts
+and incremental caches. These were removed while preserving the running release
+binary and all account state. Three unused project build images and obsolete
+ordinary rollback copies were also removed, releasing 36.1 GB in the observed
+run. The root disk went from approximately 63% to 45% used. Polycopier's total
+project footprint became less than 1 GB; its trade state and log are only kilobytes.
+
+The previous Arbigab/Polymarket retention timers were disabled and did not cover
+this Rust project. A dedicated polycopier-storage-maintenance.timer now runs
+about every ten minutes. Its root-owned helper is installed at
+/usr/local/lib/polycopier-storage/storage-maintenance.py, with a shared production
+lock and a build lock. It refuses cleanup during a build and only removes named
+compiler-cache directories. The executable hash is checked before and after.
+It keeps the latest three ordinary update backups and all experiment-reset
+milestones. It never prunes Docker volumes or other projects' files. Only the
+three exact project toolchain image IDs may be removed, and only when no
+container references them; Docker removal never uses force or global prune.
+
+Log rotation is installed at /etc/logrotate.d/polycopier: 10 MB maximum-size
+rotation checks, three compressed archives, copytruncate, every maintenance run.
+Accounting, journal, credentials and ledger files are excluded. The helper writes
+one latest report, /opt/polycopier/storage-status.json, rather than accumulating
+reports. Usage >=80% or free space <20 GiB causes an explicit failed check and a
+journal alert. systemctl status polycopier-storage-maintenance.service and
+systemctl list-timers polycopier-storage-maintenance.timer expose its result.
+
+Builds now disable dev/test debug symbols and incremental compilation, require
+15 GiB free before starting, and run bounded cleanup on exit. Cleanup does not
+restart the preview or reset the experiment. The installed maintenance helper
+and logrotate configuration are root-owned; future changes must be installed
+from the checked-in deploy sources. File/symlink boundary, hardlinked executable
+preservation and backup-milestone retention are covered by three Python tests.
+
+Public source activity reports executions, including maker fills. It does not
+expose a foreign wallet's resting orders or their placements/cancellations. The
+public market book is aggregated by price/size; authenticated user updates belong
+to the authenticated account. Live code builds GTC limit orders at the configured
+price bounds. Paper mode is an instant taker-fill model at that limit price and
+does not simulate resting GTC matching or maker rebates.

@@ -1,0 +1,19 @@
+[Unit]
+Description=Polycopier bounded cache cleanup and disk check
+After=local-fs.target docker.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/polycopier
+ExecStart=/usr/bin/flock -n /opt/arbigab/operator_control/locks/production.lock /usr/bin/python3 /usr/local/lib/polycopier-storage/storage-maintenance.py --apply
+Nice=15
+IOSchedulingClass=idle
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/polycopier /opt/arbigab/operator_control/locks /var/lib/polycopier-storage
+PrivateTmp=true
+TimeoutStartSec=180
+StandardOutput=journal
+StandardError=journal
