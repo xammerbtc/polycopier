@@ -10,6 +10,12 @@ use std::{
 #[derive(Clone, Default, Serialize)]
 pub struct Metrics {
     pub execution_mode: String,
+    pub unique_signals_delivered: u64,
+    pub duplicate_signals: u64,
+    pub expired_signals: u64,
+    pub polling_errors: u64,
+    pub polling_page_limit_hits: u64,
+    pub last_poll_duration_ms: Option<u64>,
     pub order_acceptances: u64,
     pub last_fill_to_accept_upper_bound_ms: Option<i64>,
     pub last_receive_to_accept_ms: Option<u64>,
@@ -31,6 +37,25 @@ static RECEIVED: LazyLock<Mutex<HashMap<String, Observation>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static PREPARED: LazyLock<Mutex<HashMap<String, (TradeEvent, Instant)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub fn signal_delivered() {
+    METRICS.lock().unwrap().unique_signals_delivered += 1;
+}
+pub fn signal_duplicate() {
+    METRICS.lock().unwrap().duplicate_signals += 1;
+}
+pub fn signal_expired() {
+    METRICS.lock().unwrap().expired_signals += 1;
+}
+pub fn poll_error() {
+    METRICS.lock().unwrap().polling_errors += 1;
+}
+pub fn poll_page_limit() {
+    METRICS.lock().unwrap().polling_page_limit_hits += 1;
+}
+pub fn poll_complete(ms: u64) {
+    METRICS.lock().unwrap().last_poll_duration_ms = Some(ms);
+}
 
 pub fn prepare(event: &TradeEvent) {
     let mut pending = PREPARED.lock().unwrap();

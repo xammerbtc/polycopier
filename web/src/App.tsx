@@ -24,7 +24,8 @@ function App() {
           setSetupRequired(true);
         } else {
           setSetupRequired(false);
-          setState(data);
+          const metrics = await fetch('/api/metrics', {signal: controller.signal}).then(r => r.ok ? r.json() : null).catch(() => null);
+          if (!disposed) setState({...data, metrics});
         }
       } catch (err) {
         if (!disposed) console.error('Failed to fetch state', err);
@@ -50,6 +51,8 @@ function App() {
       </div>
     );
   }
+
+  const pendingOrders = state.mode === 'simulation' ? Object.values(state.pending_orders || {}) : (state.active_orders || []);
 
   const targets = (state.target_positions || []).sort((a: any, b: any) => {
     const statusScore = (s: string) => s.includes('Monitoring') ? 0 : s.includes('Entered') ? 1 : 2;
@@ -128,7 +131,7 @@ function App() {
             </span>
           </div>
           <div className="stat-card">
-            <span className="stat-label">Copies Executed</span>
+            <span className="stat-label">Signals validated</span>
             <span className="stat-value">{state.copies_executed}</span>
           </div>
           <div className="stat-card">
@@ -136,7 +139,7 @@ function App() {
             <span className="stat-value">{state.trades_skipped}</span>
           </div>
           <div className="stat-card">
-            <span className="stat-label">Next Scan</span>
+            <span className="stat-label">Positions refresh</span>
             <span className="stat-value">{state.next_scan_secs}s</span>
           </div>
           <div className="stat-card"><span className="stat-label">Realized PnL</span><span className="stat-value">${parseFloat(state.realized_pnl).toFixed(2)}</span></div>
@@ -217,6 +220,12 @@ function App() {
             </div>
           </div>
 
+          <div className="glass-panel" style={{ marginBottom: '1.5rem' }}>
+            <div className="panel-header">Signal monitoring</div>
+            <p>WebSocket + 1s fallback polling · maker and taker fills · 5-minute recovery window</p>
+            {state.metrics && <p>Unique signals: {state.metrics.unique_signals_delivered} · Duplicates filtered: {state.metrics.duplicate_signals} · Poll errors: {state.metrics.polling_errors} · Page-limit warnings: {state.metrics.polling_page_limit_hits} · Last poll: {state.metrics.last_poll_duration_ms ?? '—'} ms</p>}
+            <p style={{ color: 'var(--text-secondary)' }}>A received signal can still be skipped; the Live Feed shows the reason. Signals validated is a pre-execution count.</p>
+          </div>
           <Operations mode={state.mode} />
           <div className="grid-cols-2">
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
@@ -224,10 +233,10 @@ function App() {
             {/* Active API Limit Orders */}
             <div className="glass-panel">
               <div className="panel-header">
-                {state.mode === 'simulation' ? 'Paper pending orders' : 'Active API Limits'}
+                {state.mode === 'simulation' ? 'Paper orders processing' : 'Active API Limits'}
                 <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                   <span className="live-badge" style={{ fontSize: '0.6rem', padding: '2px 4px' }}>{state.mode === 'simulation' ? 'SIMULATION' : 'LIVE BOOK'}</span>
-                  <span className="panel-subtitle">Pending: {(state.active_orders || []).length}</span>
+                  <span className="panel-subtitle">Pending: {pendingOrders.length}</span>
                 </div>
               </div>
               <div className="table-container">
@@ -242,7 +251,7 @@ function App() {
                     </tr>
                   </thead>
                   <tbody>
-                    {(state.active_orders || []).map((order: any, i: number) => {
+                    {pendingOrders.map((order: any, i: number) => {
                       const tokenId = order.token_id;
                       const t = targets.find((x: any) => x.token_id === tokenId);
                       const title = t ? t.title : `${tokenId.substring(0, 15)}...`;
@@ -268,8 +277,8 @@ function App() {
                         </tr>
                       );
                     })}
-                    {(state.active_orders || []).length === 0 && (
-                      <tr><td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-secondary)' }}>No resting limit orders</td></tr>
+                    {pendingOrders.length === 0 && (
+                      <tr><td colSpan={5} style={{ textAlign: 'center', color: 'var(--text-secondary)' }}>{state.mode === 'simulation' ? 'No orders processing. Paper orders fill immediately; see Paper Positions and trade history.' : 'No resting limit orders'}</td></tr>
                     )}
                   </tbody>
                 </table>

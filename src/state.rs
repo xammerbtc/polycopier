@@ -107,7 +107,9 @@ impl BotState {
         // to infinitely increment the skips counter or flood the UI feed with IDENTICAL
         // rejection events every single cycle.
         let is_duplicate = self.live_feed.iter().any(|existing| {
-            existing.validated == trade.validated
+            crate::rtds::event_key(&existing.original_event)
+                == crate::rtds::event_key(&trade.original_event)
+                && existing.validated == trade.validated
                 && existing.original_event.token_id == trade.original_event.token_id
                 && existing.original_event.side == trade.original_event.side
                 && existing.reason == trade.reason

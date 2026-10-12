@@ -11,8 +11,7 @@ use std::str::FromStr;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-/// How many recent tx hashes to remember for deduplication.
-/// At 20 trades/poll x 1 poll/2s, 500 covers ~50 seconds of burst.
+/// Bounded memory for recently delivered fills.
 const SEEN_HASHES_CAP: usize = 20000;
 pub static LAST_POLL_SUCCESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ACTIVE_TARGETS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
@@ -30,13 +29,15 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
         let mut seen_order: VecDeque<String> = VecDeque::new();
         // Gap 6: track consecutive API errors per target for backoff.
         let mut consecutive_errors: u32 = 0;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             config.hot_reload();
             if let Ok(mut active) = ACTIVE_TARGETS.write() {
                 *active = config.target_wallets.clone();
             }
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            interval.tick().await;
 
             let mut had_error = false;
 
@@ -46,35 +47,31 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
                     Err(_) => continue,
                 };
 
-                // Fetch the last 1000 trades (was 20 - raised to survive hyper-active algorithmic targets)
-                let req = match TradesRequest::builder()
-                    .user(target_addr)
-                    .limit(1000)
-                    .map(|b| b.build())
-                {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-
-                let mut trades = match data_client.trades(&req).await {
-                    Ok(t) => {
-                        LAST_POLL_SUCCESS.store(
-                            Utc::now().timestamp() as u64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        // Success — backoff reset happens after the full loop
-                        t
-                    }
-                    Err(e) => {
-                        had_error = true;
-                        warn!(
-                            "Listener: API error for {}: {e} (consecutive_errors={})",
-                            &target[..target.len().min(10)],
-                            consecutive_errors + 1
-                        );
-                        continue; // skip this target this cycle
-                    }
-                };
+                let poll_started = std::time::Instant::now();
+                let mut trades =
+                    match fetch_recent(&data_client, target_addr, Utc::now().timestamp() - 300)
+                        .await
+                    {
+                        Ok(t) => {
+                            LAST_POLL_SUCCESS.store(
+                                Utc::now().timestamp() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            // Success — backoff reset happens after the full loop
+                            t
+                        }
+                        Err(e) => {
+                            crate::latency::poll_error();
+                            had_error = true;
+                            warn!(
+                                "Listener: API error for {}: {e} (consecutive_errors={})",
+                                &target[..target.len().min(10)],
+                                consecutive_errors + 1
+                            );
+                            continue; // skip this target this cycle
+                        }
+                    };
+                crate::latency::poll_complete(poll_started.elapsed().as_millis() as u64);
 
                 // Data API returns newest first. Preserve BUY/SELL chronology
                 // when several fallback fills arrive in the same polling batch.
@@ -160,6 +157,50 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
     Ok(())
 }
 
+const PAGE_SIZE: i32 = 500;
+
+fn page_request(wallet: Address, offset: i32) -> Result<TradesRequest> {
+    Ok(TradesRequest::builder()
+        .user(wallet)
+        .taker_only(false)
+        .limit(PAGE_SIZE)?
+        .offset(offset)?
+        .build())
+}
+
+fn more_pages(count: usize, oldest: Option<i64>, cutoff: i64) -> bool {
+    count == PAGE_SIZE as usize && oldest.is_some_and(|timestamp| timestamp >= cutoff)
+}
+
+async fn fetch_recent(
+    client: &DataClient,
+    wallet: Address,
+    cutoff: i64,
+) -> Result<Vec<polymarket_client_sdk::data::types::response::Trade>> {
+    let mut trades = Vec::new();
+    for offset in (0..=10000).step_by(PAGE_SIZE as usize) {
+        let page = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.trades(&page_request(wallet, offset)?),
+        )
+        .await??;
+        let more = more_pages(
+            page.len(),
+            page.iter().map(|trade| trade.timestamp).min(),
+            cutoff,
+        );
+        trades.extend(page);
+        if !more {
+            break;
+        }
+        if offset == 10000 {
+            crate::latency::poll_page_limit();
+            warn!("Listener: pagination limit reached; five-minute coverage is incomplete");
+        }
+    }
+    Ok(trades)
+}
+
 /// Insert a hash into the dedup set, evicting the oldest entry when capacity is reached.
 fn evict_and_insert(seen: &mut HashSet<String>, order: &mut VecDeque<String>, hash: String) {
     if order.len() >= SEEN_HASHES_CAP {
@@ -169,4 +210,25 @@ fn evict_and_insert(seen: &mut HashSet<String>, order: &mut VecDeque<String>, ha
     }
     seen.insert(hash.clone());
     order.push_back(hash);
+}
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::*;
+
+    #[test]
+    fn request_includes_maker_fills_and_offset() {
+        let value = serde_json::to_value(page_request(Address::ZERO, 500).unwrap()).unwrap();
+        assert_eq!(value["takerOnly"], false);
+        assert_eq!(value["limit"], 500);
+        assert_eq!(value["offset"], 500);
+    }
+
+    #[test]
+    fn full_page_at_cutoff_keeps_same_second_fills() {
+        assert!(more_pages(500, Some(100), 100));
+        assert!(!more_pages(500, Some(99), 100));
+        assert!(!more_pages(499, Some(101), 100));
+        assert!(!more_pages(0, None, 100));
+    }
 }

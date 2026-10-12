@@ -1,4 +1,4 @@
-"""Start the explicitly requested fresh $1000 / 50% paper experiment.
+"""Start the explicitly requested fresh $10000 / 100% paper experiment.
 
 Run only under /opt/arbigab/operator_control/locks/production.lock.
 Backups include the stopped experiment state, unit, config and running binary.
@@ -25,8 +25,13 @@ backup.mkdir(mode=0o700)
 shutil.copyfile('/proc/' + pid + '/exe', backup / 'polycopier')
 shutil.copy2(unit, backup / 'preview.service')
 shutil.copy2(root / 'config.toml', backup / 'config.toml')
+if (root / 'paper-experiment.json').exists():
+    shutil.copy2(root / 'paper-experiment.json', backup / 'paper-experiment.json')
 subprocess.run(['systemctl', 'stop', 'polycopier-preview'], check=True)
 names = ['simulation_state.json', 'sim_copy_ledger.json', 'runtime-risk.json']
+log_path = root / 'polycopier.log'
+if log_path.exists():
+    shutil.copy2(log_path, backup / 'polycopier.log')
 for name in names:
     if (root / name).exists():
         shutil.copy2(root / name, backup / name)
@@ -34,18 +39,18 @@ for name in names:
 wallet = '0x2d2d2b32e5199edf833594a99b9c54e5668ab69d'
 start = int(time.time()) + 1
 profile = f'''[targets]
-wallets = ["{wallet}:0.5"]
+wallets = ["{wallet}:1.0"]
 
 [execution]
 max_slippage_pct = 0.015
 max_trade_size_usd = 1000000000
-max_delay_seconds = 6
+max_delay_seconds = 300
 sell_fee_buffer = 1
 ignore_closing_in_mins = 0
 
 [sizing]
 mode = "target_scalar"
-copy_size_pct = 0.5
+copy_size_pct = 1.0
 
 [scanner]
 max_copy_loss_pct = 1
@@ -66,17 +71,19 @@ retention_days = 60
 '''
 
 try:
+    if log_path.exists():
+        log_path.write_text('')
     (root / 'config.toml').write_text(profile)
     for name in names:
         (root / name).unlink(missing_ok=True)
-    seed = {'positions': {}, 'total_balance': '1000', 'realized_pnl': '0', 'cycle_pnl': {}, 'outcomes': []}
+    seed = {'positions': {}, 'total_balance': '10000', 'realized_pnl': '0', 'cycle_pnl': {}, 'outcomes': []}
     (root / 'simulation_state.json').write_text(json.dumps(seed, indent=2))
     (root / 'sim_copy_ledger.json').write_text('{"entries": []}')
     for name in names[:2]:
         shutil.chown(root / name, user='polycopier', group='polycopier')
         os.chmod(root / name, 0o600)
     service = unit.read_text()
-    service, replacements = re.subn(r'--sim-balance\s+[0-9.]+', '--sim-balance 1000', service)
+    service, replacements = re.subn(r'--sim-balance\s+[0-9.]+', '--sim-balance 10000', service)
     assert replacements == 1 and '--sim ' in service
     service = re.sub(r'^Environment=PAPER_EXPERIMENT_START_TIMESTAMP=.*\n', '', service, flags=re.M)
     service = service.replace('[Service]\n', '[Service]\nEnvironment=PAPER_EXPERIMENT_START_TIMESTAMP=' + str(start) + '\n')
@@ -99,13 +106,13 @@ try:
                 raise
             time.sleep(1)
     config = get('/api/config')
-    assert config['targets']['wallets'] == [wallet + ':0.5']
+    assert config['targets']['wallets'] == [wallet + ':1.0']
     assert config['sizing']['mode'] == 'target_scalar'
     assert float(config['risk']['max_daily_volume_usd']) == 0
     assert config['risk']['max_consecutive_losses'] == 0
     report = {'started_at_utc': datetime.datetime.fromtimestamp(start, datetime.timezone.utc).isoformat(),
-              'opening_bank': 1000, 'opening_positions': 0, 'opening_realized_pnl': 0,
-              'opening_daily_volume': 0, 'copy_share_fraction': 0.5, 'mode': 'simulation',
+              'opening_bank': 10000, 'opening_positions': 0, 'opening_realized_pnl': 0,
+              'opening_daily_volume': 0, 'copy_share_fraction': 1.0, 'mode': 'simulation',
               'backup': str(backup), 'config': config, 'state_after_start': state}
     (root / 'paper-experiment.json').write_text(json.dumps(report, indent=2))
     print(json.dumps({'experiment': {key: report[key] for key in report if key not in ['config', 'state_after_start']},
@@ -113,6 +120,8 @@ try:
                       'positions': len(state['positions'])}, indent=2))
 except Exception:
     subprocess.run(['systemctl', 'stop', 'polycopier-preview'], check=False)
+    if (backup / 'polycopier.log').exists():
+        shutil.copy2(backup / 'polycopier.log', log_path)
     shutil.copy2(backup / 'config.toml', root / 'config.toml')
     shutil.copy2(backup / 'preview.service', unit)
     shutil.copyfile(backup / 'polycopier', root / 'target/release/polycopier')

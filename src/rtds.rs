@@ -68,7 +68,7 @@ pub fn parse_activity(v: &serde_json::Value, targets: &[String]) -> Option<Trade
 }
 
 pub async fn start(config: &Config, tx: mpsc::Sender<TradeEvent>) -> anyhow::Result<()> {
-    let (raw_tx, mut raw_rx) = mpsc::channel::<TradeEvent>(1000);
+    let (raw_tx, mut raw_rx) = mpsc::channel::<TradeEvent>(4096);
     crate::listener::start_ws_listener(config, raw_tx.clone()).await?;
     let paper_start = if config.is_sim {
         std::env::var("PAPER_EXPERIMENT_START_TIMESTAMP")
@@ -86,15 +86,18 @@ pub async fn start(config: &Config, tx: mpsc::Sender<TradeEvent>) -> anyhow::Res
             }
             let age = chrono::Utc::now().timestamp() - event.timestamp;
             if !(0..=300).contains(&age) {
+                crate::latency::signal_expired();
                 continue;
             }
             let key = event_key(&event);
             if seen.contains(&key) {
+                crate::latency::signal_duplicate();
                 continue;
             }
             if tx.send(event).await.is_err() {
                 return;
             }
+            crate::latency::signal_delivered();
             if order.len() >= 20000 {
                 if let Some(old) = order.pop_front() {
                     seen.remove(&old);

@@ -134,7 +134,12 @@ pub fn start_position_scanner(
             };
 
             // Intercept: use shortest interval between adaptive needs and chronological alignment.
-            let interval_secs = adaptive_interval.min(secs_until_burst);
+            let interval_secs = if config.scan_max_entries_per_cycle == 0 {
+                // Monitoring-only holdings refresh is independent of fill ingestion.
+                30
+            } else {
+                adaptive_interval.min(secs_until_burst)
+            };
 
             // Apply backoff on top of normal interval if API is misbehaving.
             let sleep_secs = if consecutive_errors > 0 {

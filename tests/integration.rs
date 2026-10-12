@@ -344,6 +344,19 @@ mod state_tests {
     }
 
     #[test]
+    fn distinct_fills_of_same_token_remain_visible() {
+        let mut state = BotState::new(false, None);
+        let first = make_eval(true);
+        let mut second = first.clone();
+        second.original_event.transaction_hash = "different-fill".into();
+        state.push_evaluated_trade(first.clone());
+        state.push_evaluated_trade(second);
+        state.push_evaluated_trade(first);
+        assert_eq!(state.live_feed.len(), 2);
+        assert_eq!(state.copies_executed, 2);
+    }
+
+    #[test]
     fn redundant_evaluated_trades_are_debounced() {
         let mut state = BotState::new(false, None);
         let eval = make_eval(false); // simulates a rejected trade

@@ -267,7 +267,7 @@ async fn main() -> anyhow::Result<()> {
         (submitter, fetcher, Some(client))
     };
 
-    let (event_tx, event_rx) = tokio::sync::mpsc::channel(100);
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(4096);
 
     // ── Copy ledger ───────────────────────────────────────────────────────────
     // Load the persisted copy ledger.  This records which positions we entered

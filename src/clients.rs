@@ -184,8 +184,7 @@ pub async fn build_sim_order_submitter(
                 order.size,
                 order.token_id
             );
-            // Simulate normal API delay
-            tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+            // Paper acceptance has no artificial network delay.
             Ok(())
         })
     });

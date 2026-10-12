@@ -315,8 +315,7 @@ round up. The rounded price must still satisfy the exact configured slippage
 bound; impossible price bounds skip the order instead of relaxing the limit.
 
 Dispatch latency is recorded immediately before the live CLOB POST, after SDK
-order preparation/signing and durable intent. Paper mode records dispatch before
-its simulated matching delay. Preparation alone does not count as a dispatch;
+order preparation/signing and durable intent. Paper mode records dispatch immediately before its simulated acceptance. Preparation alone does not count as a dispatch;
 failed preparation clears its marker. Dispatch and acknowledgement expose their
 source event keys so a qualification cannot combine two concurrent signals.
 
@@ -336,11 +335,44 @@ books, without treating them as an executed redemption or cash payout.
 RTDS and polling prices are canonicalized to six decimals for the shared fill
 key, retaining transaction, wallet, token, side and share count. This suppresses
 false stale-signal rejections of already-copied fills. Polling batches are
-processed in timestamp order. The six-second freshness limit still applies to
-actual new signals.
+processed in timestamp order. Freshness follows the configured max_delay_seconds; the new paper profile uses
+a five-minute recovery window.
 
 Proportional paper mode no longer runs the target-position disappearance sweep
 and ignores any queued `sweep_` signals. That legacy sweep generated artificial
 SELLs at $0.01, which are not target fills. Earlier paper inventory and realized
 PnL may include these artificial exits. The correction preserves that historical
 state and does not silently rewrite performance or restart the experiment.
+
+
+## Fresh $10,000 / 100% experiment (2026-10-12)
+
+The operator requested a new paper run, with a $10,000 opening balance and a
+1.0 target-share scalar. The reset saves the previous book, ledger, risk state,
+unit, config, running binary and previous experiment report before clearing the
+paper account. Only signals timestamped at or after the new start are eligible.
+Daily-volume and consecutive-loss limits stay disabled; catch-up entries and
+synthetic disappearance SELLs stay disabled. Historical source holdings are not
+seeded into this empty account. A SELL without copier inventory is skipped.
+Order share quantities retain the existing two-decimal truncation, and buys
+still require enough paper cash including fees.
+
+RTDS remains primary. A reused SDK HTTP client polls every second (skipping
+missed ticks), explicitly includes maker and taker trades and paginates 500-fill
+pages through the last five minutes. Each page has a five-second timeout;
+errors retain backoff. Offset exhaustion is logged and counted, not presented
+as complete coverage. Pages are sorted before dispatch; overlapping polls and
+RTDS share deduplication. The in-memory queues hold 4096 signals. This is bounded
+recovery, not an exactly-once or zero-latency guarantee across API outages or
+process crashes. Source timestamps have one-second precision.
+
+Monitoring-only target holdings refresh every 30 seconds independently of fills.
+Fee/price HTTP connections use a two-second connect timeout, five-second total
+timeout, TCP_NODELAY and keepalive. The artificial 150 ms paper delay is removed.
+The dashboard shows signal, duplicate, poll-error and pagination-limit counters.
+Its paper processing table uses pending_orders, while completed fills appear
+in Paper Positions and history. The validated-signal count is explicitly a
+pre-execution count, not a count of fills. Distinct same-token fills remain
+separate in the feed. The new profile accepts fallback signals up to 300 seconds
+old; paper prices still model instant fills at the strategy limit price, so this
+experiment does not measure real execution liquidity or achievable live latency.

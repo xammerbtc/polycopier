@@ -45,6 +45,10 @@ pub fn taker_fee(shares: Decimal, price: Decimal, rate: Decimal) -> Decimal {
 }
 pub fn public_query() -> FeeQuery {
     let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .tcp_nodelay(true)
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .pool_idle_timeout(std::time::Duration::from_secs(60))
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .expect("fee HTTP client");
