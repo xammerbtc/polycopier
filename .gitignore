@@ -76,3 +76,9 @@ latency-paper-qualification.json
 # Generated Python bytecode is not source.
 __pycache__/
 *.py[cod]
+
+# Runtime storage supervision outputs.
+/.build.lock
+/storage-status.json
+/.storage-status-*
+/storage-logrotate.status
