@@ -147,7 +147,6 @@ function App() {
       {activeTab === 'dashboard' ? (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
           {/* Our Open Positions - FULL WIDTH */}
-          <Operations mode={state.mode} />
           <div className="glass-panel">
             <div className="panel-header">
               {state.mode === 'simulation' ? 'Paper Positions' : 'Our Positions'}
@@ -171,7 +170,8 @@ function App() {
                 <tbody>
                   {Object.values(state.positions || {}).map((p: any, i: number) => {
                     const t = targets.find((x: any) => x.token_id === p.token_id);
-                    const title = t ? t.title : `${p.token_id.substring(0, 15)}...`;
+                    const metadata = state.position_details?.[p.token_id];
+                    const title = metadata?.title || (t ? t.title : `${p.token_id.substring(0, 15)}...`);
                     const sourceWallet = state.position_sources ? (state.position_sources[p.token_id] || 'Unknown') : 'Unknown';
                     const shortWallet = sourceWallet === 'Unknown' ? 'Unknown' : `${sourceWallet.substring(0, 6)}...${sourceWallet.substring(sourceWallet.length - 4)}`;
                     const ourAvg = parseFloat(p.average_entry_price);
@@ -184,7 +184,7 @@ function App() {
                     
                     return (
                       <tr key={i}>
-                        <td className="td-truncate" title={title} style={{ maxWidth: '300px' }}>{title}</td>
+                        <td className="td-truncate" title={`${title}\nToken: ${p.token_id}`} style={{ maxWidth: '300px' }}>{title}<div style={{color:'var(--text-secondary)',fontSize:'12px'}}>{metadata?.outcome || t?.outcome || 'Outcome unavailable'}</div></td>
                         <td>
                           {sourceWallet !== 'Unknown' ? (
                             <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
@@ -197,7 +197,7 @@ function App() {
                         </td>
                         <td>{parseFloat(p.size).toFixed(2)}</td>
                         <td>${ourAvg.toFixed(3)}</td>
-                        <td>{hasPrice ? `$${curPrice.toFixed(3)}` : 'Unavailable'}</td>
+                        <td>{hasPrice ? `$${curPrice.toFixed(3)}` : 'Unavailable'}<div style={{color:'var(--text-secondary)',fontSize:'11px'}}>{metadata?.price_source || ''}</div></td>
                         <td>{targetAvg > 0 ? `$${targetAvg.toFixed(3)}` : '-'}</td>
                         <td className={targetAvg > 0 ? (diffPct > 0 ? 'val-negative' : 'val-positive') : ''}>
                           {targetAvg > 0 ? `${diffPct > 0 ? '+' : ''}${diffPct.toFixed(1)}%` : '-'}
@@ -205,7 +205,7 @@ function App() {
                         <td className={pnlUsd !== 0 ? (pnlUsd > 0 ? 'val-positive' : 'val-negative') : ''}>
                           {hasPrice ? `${pnlUsd > 0 ? '+' : ''}$${pnlUsd.toFixed(2)} (${pnlPct > 0 ? '+' : ''}${pnlPct.toFixed(1)}%)` : 'Unavailable'}
                         </td>
-                        <td><span className="status status-HELD">HELD</span></td>
+                        <td><span className="status status-HELD">{metadata?.closed ? 'CLOSED MARKET' : 'HELD'}</span>{metadata?.end_date && <div style={{fontSize:'11px',color:'var(--text-secondary)'}}>{new Date(metadata.end_date).toLocaleString()}</div>}</td>
                       </tr>
                     );
                   })}
@@ -217,6 +217,7 @@ function App() {
             </div>
           </div>
 
+          <Operations mode={state.mode} />
           <div className="grid-cols-2">
             <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
 

@@ -45,7 +45,7 @@ export default function Operations({mode = 'simulation'}: {mode?: string}) {
     </div>
     {redeemResult && <p role="status">{redeemResult}</p>}
     {mode==='live' && pendingRedemption && <p role="status">Redemption is pending confirmation or needs attention. The bot is paused; do not retry.</p>}
-    <div className="table-container"><table><thead><tr><th>Time (UTC)</th><th>Source wallet</th><th>Token</th><th>Entry</th><th>Size</th><th>Status</th></tr></thead><tbody>
+    <div className="table-container" style={{maxHeight:'320px',overflow:'auto'}}><table><thead><tr><th>Time (UTC)</th><th>Source wallet</th><th>Token</th><th>Entry</th><th>Size</th><th>Status</th></tr></thead><tbody>
       {filtered.slice().reverse().map((e,i) => <tr key={i}><td>{e.copied_at}</td><td>{e.source_wallet}</td><td>{e.token_id.slice(0,16)}</td><td>{e.entry_price}</td><td>{e.size}</td><td>{e.closed ? 'Closed' : 'Open'}</td></tr>)}
       {!filtered.length && <tr><td colSpan={6}>No copied trades recorded for this filter.</td></tr>}
     </tbody></table></div>

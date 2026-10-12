@@ -324,3 +324,23 @@ An isolated five-minute paper latency observation on 2026-10-11 connected to
 RTDS but received no new target-wallet trades before its runtime limit. It used
 closing=0 and catch-up disabled, had no trading credentials, and did not change
 the deployed closing=20 profile. It provides no qualifying fill-to-order sample.
+
+## Position display and paper sweep correction (2026-10-12)
+
+Owned positions appear above history and include their independently queried
+market title, outcome, end time, market status and price source. Gamma lookups
+match exact CTF token IDs and explicitly include closed markets. Active CLOB
+midpoints are preferred; Gamma outcome reference prices cover removed order
+books, without treating them as an executed redemption or cash payout.
+
+RTDS and polling prices are canonicalized to six decimals for the shared fill
+key, retaining transaction, wallet, token, side and share count. This suppresses
+false stale-signal rejections of already-copied fills. Polling batches are
+processed in timestamp order. The six-second freshness limit still applies to
+actual new signals.
+
+Proportional paper mode no longer runs the target-position disappearance sweep
+and ignores any queued `sweep_` signals. That legacy sweep generated artificial
+SELLs at $0.01, which are not target fills. Earlier paper inventory and realized
+PnL may include these artificial exits. The correction preserves that historical
+state and does not silently rewrite performance or restart the experiment.

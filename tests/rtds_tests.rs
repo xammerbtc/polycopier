@@ -3,6 +3,21 @@ use polycopier::{
     rtds::{event_key, parse_activity},
 };
 #[test]
+fn deduplicates_websocket_and_polling_price_precision() {
+    let wallet = "0xabc".to_string();
+    let mut frame = serde_json::json!({"topic":"activity","type":"trades","payload":{"proxyWallet":wallet,"transactionHash":"0xtx","asset":"123","price":"0.6999999719999955","size":"7.142856","side":"BUY","timestamp":12345}});
+    let ws = parse_activity(&frame, std::slice::from_ref(&wallet)).unwrap();
+    frame["payload"]["price"] = "0.699999972".into();
+    frame["payload"]["timestamp"] = 12346.into();
+    let poll = parse_activity(&frame, std::slice::from_ref(&wallet)).unwrap();
+    assert_eq!(event_key(&ws), event_key(&poll));
+    frame["payload"]["size"] = "8.142856".into();
+    assert_ne!(
+        event_key(&ws),
+        event_key(&parse_activity(&frame, &[wallet]).unwrap())
+    );
+}
+#[test]
 fn filters_wallets_and_preserves_transaction_identity() {
     let wallet = "0x2d2d2b32e5199edf833594a99b9c54e5668ab69d".to_string();
     let mut frame = serde_json::json!({"topic":"activity","type":"trades","payload":{"proxyWallet":wallet.to_uppercase(),"transactionHash":"0xabc","asset":"123","price":0.5,"size":10,"side":"BUY","timestamp":12345}});

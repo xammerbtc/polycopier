@@ -447,6 +447,9 @@ pub fn start_strategy_engine_with_fees(
             // partial exits. Finish the preceding fill before sizing this token.
             let proportional_paper =
                 config.is_sim && config.sizing_mode == SizingMode::TargetScalar;
+            if proportional_paper && event.transaction_hash.starts_with("sweep_") {
+                continue; // Only actual target fills can change proportional paper inventory.
+            }
             if proportional_paper {
                 let deadline = Instant::now() + Duration::from_secs(30);
                 while state

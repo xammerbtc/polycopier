@@ -11,6 +11,7 @@ pub mod listener;
 pub mod live_fills;
 pub mod live_redemption;
 pub mod log_capture;
+pub mod markets;
 pub mod models;
 pub mod order_watcher;
 pub mod position_scanner;
@@ -363,7 +364,9 @@ async fn main() -> anyhow::Result<()> {
     // Position-close sweep — backstop that emits synthetic SELLs for any
     // position we hold that no target still holds (catches missed WS SELL events).
     // Gap 2 fix: pass copy_ledger so sweep uses the correct source_wallet.
-    wallet_sync::start_position_close_sweep(state.clone(), event_tx, copy_ledger.clone());
+    if !(config.is_sim && config.sizing_mode == config::SizingMode::TargetScalar) {
+        wallet_sync::start_position_close_sweep(state.clone(), event_tx, copy_ledger.clone());
+    }
 
     // Copied counter (header "Copied: N" — live API intersection every 30 s)
     copied_counter::start_copied_counter(

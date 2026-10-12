@@ -483,6 +483,7 @@ async fn handle_setup(Json(payload): Json<SetupPayload>) -> axum::response::Resp
 
 #[derive(Serialize)]
 pub struct StateResponse {
+    pub position_details: HashMap<String, crate::markets::Details>,
     pub position_prices: HashMap<String, Decimal>,
     pub prices_updated_at: u64,
     pub paused: bool,
@@ -544,6 +545,7 @@ async fn get_state(State(api_state): State<ApiState>) -> Json<StateResponse> {
 
     // Convert current state to serializable DTO, stripping Instants
     let response = StateResponse {
+        position_details: guard.position_details.clone(),
         position_prices: guard.position_prices.clone(),
         prices_updated_at: guard.prices_updated_at,
         paused: guard.started,

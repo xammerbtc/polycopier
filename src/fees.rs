@@ -51,19 +51,8 @@ pub fn public_query() -> FeeQuery {
     Arc::new(move |token| {
         let client = client.clone();
         Box::pin(async move {
-            let markets: Value = client
-                .get("https://gamma-api.polymarket.com/markets")
-                .query(&[("clob_token_ids", &token)])
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
-            let markets = markets
-                .as_array()
-                .ok_or_else(|| anyhow::anyhow!("Invalid fee market response"))?;
-            anyhow::ensure!(markets.len() == 1, "Ambiguous fee market response");
-            rate(&markets[0], &token)
+            let market = crate::markets::fetch(&client, &token).await?;
+            rate(&market, &token)
         })
     })
 }

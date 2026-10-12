@@ -25,8 +25,10 @@ pub fn event_key(e: &TradeEvent) -> String {
         e.taker_address.to_lowercase(),
         e.token_id,
         e.side,
-        e.price.normalize(),
-        e.size.normalize()
+        // RTDS carries a float-derived ratio while Data API rounds the same
+        // fill's price. Use exchange precision so a fallback copy is a duplicate.
+        e.price.round_dp(6).normalize(),
+        e.size.round_dp(6).normalize()
     )
 }
 

@@ -19,29 +19,59 @@ pub fn start(state: Arc<RwLock<BotState>>) {
                 .keys()
                 .cloned()
                 .collect();
-            let prices: Vec<_> = stream::iter(tokens)
+            let quotes: Vec<_> = stream::iter(tokens)
                 .map(|token| {
                     let client = client.clone();
                     async move {
-                        let response = client
-                            .get("https://clob.polymarket.com/midpoint")
-                            .query(&[("token_id", &token)])
-                            .send()
-                            .await
-                            .ok()?
-                            .error_for_status()
-                            .ok()?;
-                        let value: serde_json::Value = response.json().await.ok()?;
-                        let price = Decimal::from_str(value["mid"].as_str()?).ok()?;
-                        (price >= Decimal::ZERO && price <= Decimal::ONE).then_some((token, price))
+                        let midpoint = async {
+                            let response = client
+                                .get("https://clob.polymarket.com/midpoint")
+                                .query(&[("token_id", &token)])
+                                .send()
+                                .await
+                                .ok()?
+                                .error_for_status()
+                                .ok()?;
+                            let value: serde_json::Value = response.json().await.ok()?;
+                            let price = Decimal::from_str(value["mid"].as_str()?).ok()?;
+                            (price >= Decimal::ZERO && price <= Decimal::ONE).then_some(price)
+                        };
+                        let (mid, market) =
+                            tokio::join!(midpoint, crate::markets::fetch(&client, &token));
+                        let mut details = market
+                            .ok()
+                            .and_then(|m| crate::markets::details(&m, &token).ok());
+                        let price =
+                            mid.or_else(|| details.as_ref().and_then(|m| m.reference_price));
+                        if let Some(m) = &mut details {
+                            if mid.is_some() {
+                                m.price_source = "CLOB midpoint".into();
+                            }
+                        }
+                        (token, price, details)
                     }
                 })
                 .buffer_unordered(8)
-                .filter_map(|v| async { v })
                 .collect()
                 .await;
             let mut guard = state.write().await;
-            guard.position_prices = prices.into_iter().collect();
+            guard.position_prices.clear();
+            let held: std::collections::HashSet<_> =
+                guard.reported_positions().keys().cloned().collect();
+            guard
+                .position_details
+                .retain(|token, _| held.contains(token));
+            for (token, price, details) in quotes {
+                if !held.contains(&token) {
+                    continue;
+                }
+                if let Some(price) = price {
+                    guard.position_prices.insert(token.clone(), price);
+                }
+                if let Some(details) = details {
+                    guard.position_details.insert(token, details);
+                }
+            }
             guard.unrealized_pnl = guard
                 .reported_positions()
                 .values()

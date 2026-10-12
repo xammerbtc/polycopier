@@ -12,6 +12,7 @@ pub mod listener;
 pub mod live_fills;
 pub mod live_redemption;
 pub mod log_capture;
+pub mod markets;
 pub mod models;
 pub mod order_watcher;
 pub mod position_scanner;

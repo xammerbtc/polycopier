@@ -48,8 +48,13 @@ async fn every_paper_fill_scales_shares_and_preserves_aggregate_basis() {
     );
     // Burst additions must neither debounce away fills nor overwrite inventory.
     // Tiny paper fills are included even when below the live CLOB minimum.
+    let mut artificial = make_trade("0xabc", dec!(0.01), dec!(500), TradeSide::SELL);
+    artificial.transaction_hash = "sweep_99999".into();
+    tx.send(make_trade("0xabc", dec!(0.50), dec!(20), TradeSide::BUY))
+        .await
+        .unwrap();
+    tx.send(artificial).await.unwrap();
     for (size, side) in [
-        (dec!(20), TradeSide::BUY),
         (dec!(10), TradeSide::BUY),
         (dec!(4), TradeSide::SELL),
         (dec!(2), TradeSide::BUY),

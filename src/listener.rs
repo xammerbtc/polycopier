@@ -56,7 +56,7 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
                     Err(_) => continue,
                 };
 
-                let trades = match data_client.trades(&req).await {
+                let mut trades = match data_client.trades(&req).await {
                     Ok(t) => {
                         LAST_POLL_SUCCESS.store(
                             Utc::now().timestamp() as u64,
@@ -76,6 +76,9 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
                     }
                 };
 
+                // Data API returns newest first. Preserve BUY/SELL chronology
+                // when several fallback fills arrive in the same polling batch.
+                trades.sort_by_key(|trade| trade.timestamp);
                 for trade in trades {
                     let hash = format!(
                         "{}:{}:{}:{:?}:{}:{}",
