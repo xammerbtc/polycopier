@@ -72,3 +72,7 @@ settlement-fills.json.tmp
 fills-continuous-20261011.tar
 paper-experiment.json
 latency-paper-qualification.json
+
+# Generated Python bytecode is not source.
+__pycache__/
+*.py[cod]
