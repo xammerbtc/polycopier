@@ -1329,7 +1329,8 @@ async fn post_config(Json(payload): Json<BotConfig>) -> Response {
         )
             .into_response();
     }
-    Json(serde_json::json!({ "success": true, "hot_reload": true })).into_response()
+    let hot_reload = std::env::var("HOT_RELOAD_ENABLED").as_deref() == Ok("true");
+    Json(serde_json::json!({ "success": true, "hot_reload": hot_reload })).into_response()
 }
 
 async fn get_env() -> Json<EnvData> {

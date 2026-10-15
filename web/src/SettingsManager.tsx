@@ -84,7 +84,9 @@ export default function SettingsManager() {
         ? await response.json()
         : { error: await response.text() };
       if (!response.ok) throw new Error(result.error || "Save failed");
-      setMessage("Saved. Targets and risk settings apply automatically without restarting.");
+      setMessage(result.hot_reload === true
+        ? "Saved. Targets and risk settings apply on the next signal or scan."
+        : "Saved to disk. Running settings are unchanged until the service is restarted and its preflight checks pass.");
     } catch (e) {
       setMessage(e instanceof Error ? e.message : "Failed to save.");
     }
