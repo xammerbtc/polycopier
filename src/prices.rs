@@ -75,9 +75,14 @@ pub fn start(state: Arc<RwLock<BotState>>) {
             let refresh_tokens: Vec<_> = tokens
                 .iter()
                 .filter(|token| {
-                    market_cache
-                        .get(*token)
-                        .is_none_or(|(_, fetched)| fetched.elapsed().as_secs() >= 300)
+                    market_cache.get(*token).is_none_or(|(details, fetched)| {
+                        let ttl = if !details.closed && details.price_source == "Gamma reference" {
+                            30
+                        } else {
+                            300
+                        };
+                        fetched.elapsed().as_secs() >= ttl
+                    })
                 })
                 .cloned()
                 .collect();

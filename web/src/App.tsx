@@ -167,6 +167,11 @@ function App() {
     return price === undefined ? sum : sum + Number(position.size) * Number(price);
   }, 0);
   const unpricedShares = unpricedPositions.reduce((sum, position) => sum + Number(position.size), 0);
+  const staleOpenQuotes = positions.filter((position) =>
+    state.position_details?.[position.token_id]?.closed !== true &&
+    state.position_prices?.[position.token_id] !== undefined &&
+    Date.now() / 1000 - Number(state.price_updated_at?.[position.token_id] || 0) > 60
+  ).length;
   const equityFloor = currentBalance + pricedMarketValue;
   const equityCeiling = equityFloor + unpricedShares;
   const pnlFloor = equityFloor - startingBalance;
@@ -320,12 +325,12 @@ function App() {
           {state.mode === 'simulation' && <div className="stat-card">
             <span className="stat-label">Portfolio equity (cash + open market value)</span>
             <span className="stat-value">{state.equity == null ? `≥ $${equityFloor.toFixed(2)}` : `$${Number(state.equity).toFixed(2)}`}</span>
-            <span style={{color:'var(--text-secondary)',fontSize:'12px'}}>{unpricedPositions.length > 0 ? `Upper bound $${equityCeiling.toFixed(2)} · ` : ''}Quotes: {state.priced_positions}/{positions.length}</span>
+            <span style={{color:'var(--text-secondary)',fontSize:'12px'}}>{unpricedPositions.length > 0 ? `Upper bound $${equityCeiling.toFixed(2)} · ` : ''}Quotes: {state.priced_positions}/{positions.length}{staleOpenQuotes > 0 ? ` · ${staleOpenQuotes} open quote(s) older than 60s; indicative value` : ''}</span>
           </div>}
           {state.mode === 'simulation' && <div className="stat-card">
             <span className="stat-label">Total PnL vs starting bank</span>
             <span className={`stat-value ${state.total_pnl == null ? '' : Number(state.total_pnl) < 0 ? 'val-negative' : Number(state.total_pnl) > 0 ? 'val-positive' : ''}`}>{state.total_pnl == null ? `≥ ${pnlFloor < 0 ? '-' : '+'}$${Math.abs(pnlFloor).toFixed(2)}` : `${Number(state.total_pnl) >= 0 ? '+' : ''}$${Number(state.total_pnl).toFixed(2)}`}</span>
-            <span style={{color:'var(--text-secondary)',fontSize:'12px'}}>{state.total_pnl == null ? `Upper bound $${pnlCeiling.toFixed(2)} · ` : ''}Open cost ${Number(state.open_cost_basis).toFixed(2)}</span>
+            <span style={{color:'var(--text-secondary)',fontSize:'12px'}}>{state.total_pnl == null ? `Upper bound $${pnlCeiling.toFixed(2)} · ` : ''}Open cost ${Number(state.open_cost_basis).toFixed(2)}{staleOpenQuotes > 0 ? ' · Indicative: stale open quotes' : ''}</span>
           </div>}
           <div className="stat-card"><span className="stat-label">Daily Volume</span><span className="stat-value">${parseFloat(state.daily_volume_usd).toFixed(2)}</span></div>
         </div>
