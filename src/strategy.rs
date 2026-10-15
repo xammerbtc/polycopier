@@ -52,8 +52,50 @@ pub fn calculate_entry_size(size: Decimal, price: Decimal, max_trade_usd: Decima
 /// Any order with size < 5 shares gets a 400: "Size (X) lower than the minimum: 5"
 pub const MIN_ORDER_SHARES: Decimal = Decimal::from_parts(5, 0, 0, false, 0);
 
+/// A sale follows the fraction of the leader's position that the signal exits.
+/// `target_shares` is a scanner snapshot; it can be before or after the fill.
+pub fn proportional_source_exit(
+    our_source_shares: Decimal,
+    sold_shares: Decimal,
+    target_shares: Option<Decimal>,
+    snapshot_after_signal: bool,
+) -> Decimal {
+    if our_source_shares <= Decimal::ZERO || sold_shares <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    let Some(target_shares) = target_shares else {
+        // If the scanner has no snapshot, never sell more than the signal's
+        // share count. A subsequent confirmed full-exit sweep closes residuals.
+        return our_source_shares.min(sold_shares);
+    };
+    let before = if snapshot_after_signal {
+        target_shares + sold_shares
+    } else {
+        target_shares.max(sold_shares)
+    };
+    (our_source_shares * sold_shares / before).min(our_source_shares)
+}
+
 /// Dollar floor (secondary sanity guard Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ the real constraint is MIN_ORDER_SHARES).
 pub const MIN_ORDER_USD: Decimal = Decimal::from_parts(1, 0, 0, false, 0);
+
+/// The marketable BUY is signed at its limit price. A fee-inclusive USDC
+/// budget must still imply at least five requested shares at that price;
+/// any smaller execution can only be a partial fill of a valid order.
+pub fn budget_meets_min_order(budget_usd: Decimal, limit_price: Decimal) -> bool {
+    limit_price > Decimal::ZERO && budget_usd / limit_price >= MIN_ORDER_SHARES
+}
+
+/// A small USDC order can meet the five-share minimum at a cheaper ask even
+/// when it cannot do so at the configured maximum price. Leave fee headroom
+/// inside the budget and round down to the conservative cent tick.
+pub fn affordable_buy_limit(budget_usd: Decimal, max_price: Decimal) -> Option<Decimal> {
+    let fee_buffer = Decimal::new(102, 2);
+    let affordable = (budget_usd / (MIN_ORDER_SHARES * fee_buffer))
+        .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero);
+    let limit = max_price.min(affordable);
+    (limit >= Decimal::new(1, 2)).then_some(limit)
+}
 
 /// Compute the USD budget for a single BUY order according to the active [`SizingMode`].
 ///
@@ -62,6 +104,7 @@ pub const MIN_ORDER_USD: Decimal = Decimal::from_parts(1, 0, 0, false, 0);
 /// | `Fixed` | `max_trade_usd` (constant) |
 /// | `SelfPct` | `our_balance * copy_size_pct`, capped at `max_trade_usd` |
 /// | `TargetUsd` | `target_notional` (exact $ the target bet), capped at `max_trade_usd` |
+/// | `BankScaled` | up to $10 exact; above $10, `copy_size_pct` of source notional, capped |
 ///
 /// Returns **`Decimal::ZERO`** when the computed budget is below `MIN_ORDER_USD` ($1).
 /// Callers treat zero as "skip this order". This respects the user's configured
@@ -74,6 +117,7 @@ pub fn compute_order_usd(
     mut max_trade_usd: Decimal,
     target_notional: Decimal,
 ) -> Decimal {
+    let hard_trade_cap = max_trade_usd;
     // If the user's available balance is smaller than the hard max ceiling,
     // gracefully scale down the max ceiling to their available balance
     // minus an estimated 2% fee overhead buffer (divide by 1.02),
@@ -92,7 +136,22 @@ pub fn compute_order_usd(
         }
         SizingMode::TargetUsd => target_notional,
         SizingMode::TargetScalar => target_notional * wallet_scalar,
+        SizingMode::BankScaled => {
+            let threshold = Decimal::from(10);
+            if target_notional <= threshold {
+                target_notional
+            } else {
+                // Never increase the configured source-notional percentage
+                // just to meet the venue minimum; skip undersized signals.
+                target_notional * copy_size_pct.unwrap_or(Decimal::ZERO)
+            }
+        }
     };
+    if *sizing_mode == SizingMode::BankScaled && usable_balance < desired.min(hard_trade_cap) {
+        // A cash shortage must not silently turn an intended 1:1 copy into a
+        // smaller, unrelated bet. The strategy reports a skipped signal.
+        return Decimal::ZERO;
+    }
     let capped = desired.min(max_trade_usd);
     // Return ZERO to signal "skip" when below the CLOB minimum.
     // Never floor UP Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ that silently overrides the user's sizing config.
@@ -395,6 +454,47 @@ pub fn start_strategy_engine(
 
 #[allow(clippy::too_many_arguments)]
 pub fn start_strategy_engine_with_fees(
+    rx: mpsc::Receiver<TradeEvent>,
+    state: Arc<RwLock<BotState>>,
+    risk_engine: RiskEngine,
+    submitter: OrderSubmitter,
+    config: Config,
+    copy_ledger: Arc<Mutex<CopyLedger>>,
+    holds_query: HoldsQuery,
+    end_date_query: EndDateQuery,
+    fee_query: crate::fees::FeeQuery,
+) {
+    start_strategy_engine_with_queries(
+        rx,
+        state,
+        risk_engine,
+        submitter,
+        config,
+        copy_ledger,
+        holds_query,
+        end_date_query,
+        fee_query,
+        Arc::new(|token, size, floor| {
+            Box::pin(async move { crate::simulation::paper_sell_ladder(&token, size, floor).await })
+        }),
+    );
+}
+
+pub type PaperSellQuery = Arc<
+    dyn Fn(
+            String,
+            Decimal,
+            Option<Decimal>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = anyhow::Result<Option<crate::simulation::PaperBuyFill>>> + Send,
+            >,
+        > + Send
+        + Sync,
+>;
+
+#[allow(clippy::too_many_arguments)]
+pub fn start_strategy_engine_with_queries(
     mut rx: mpsc::Receiver<TradeEvent>,
     state: Arc<RwLock<BotState>>,
     mut risk_engine: RiskEngine,
@@ -404,6 +504,7 @@ pub fn start_strategy_engine_with_fees(
     holds_query: HoldsQuery,
     end_date_query: EndDateQuery,
     fee_query: crate::fees::FeeQuery,
+    paper_sell_query: PaperSellQuery,
 ) {
     tokio::spawn(async move {
         info!("Strategy Engine Started. Monitoring edge cases (debouncing, closures...)");
@@ -443,14 +544,13 @@ pub fn start_strategy_engine_with_fees(
                 }
             }
             config.hot_reload();
-            // Proportional paper mode copies each fill, including additions and
-            // partial exits. Finish the preceding fill before sizing this token.
+            // Paper mode keeps source-specific lots for multi-wallet attribution.
+            // TargetScalar additionally scales each BUY to the source's share size.
+            // Finish the preceding fill before sizing this token.
+            let paper_source_lots = config.is_sim;
             let proportional_paper =
-                config.is_sim && config.sizing_mode == SizingMode::TargetScalar;
-            if proportional_paper && event.transaction_hash.starts_with("sweep_") {
-                continue; // Only actual target fills can change proportional paper inventory.
-            }
-            if proportional_paper {
+                paper_source_lots && config.sizing_mode == SizingMode::TargetScalar;
+            if paper_source_lots {
                 let deadline = Instant::now() + Duration::from_secs(30);
                 while state
                     .read()
@@ -514,7 +614,11 @@ pub fn start_strategy_engine_with_fees(
                     );
                 }
             }
-            if !config.target_wallets.contains(&event.taker_address) {
+            // Locally generated exits refer to a ledger source, which may have
+            // been removed from the current watch list after its BUY filled.
+            if !event.transaction_hash.starts_with("sweep_")
+                && !config.target_wallets.contains(&event.taker_address)
+            {
                 eval.validated = false;
                 eval.reason = Some("Wallet mismatch".to_string());
             }
@@ -525,7 +629,7 @@ pub fn start_strategy_engine_with_fees(
                 event.taker_address, event.token_id, event.side
             );
             if eval.validated
-                && !proportional_paper
+                && !paper_source_lots
                 && debounce.insert_or_accumulate(cache_key, event.clone())
             {
                 continue; // accumulated Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ skip this event
@@ -669,45 +773,34 @@ pub fn start_strategy_engine_with_fees(
                 let skip_reason: Option<String> = match event.side {
                     // ---- BUY -----------------------------------------------
                     TradeSide::BUY => {
-                        if already_in_token
-                            && !(proportional_paper
-                                && ledger_entry.as_ref().is_some_and(|entry| {
-                                    entry.source_wallet == event.taker_address
-                                }))
-                        {
-                            let from = ledger_entry
-                                .as_ref()
-                                .map(|e| &e.source_wallet[..e.source_wallet.len().min(10)])
-                                .unwrap_or("unknown");
-                            Some(format!(
-                                "BUY skipped: already holding token {} (entered from {})",
-                                &event.token_id[..event.token_id.len().min(12)],
-                                from
-                            ))
-                        } else if !proportional_paper && !live_target_holds && live_we_hold {
+                        if !paper_source_lots && !already_in_token && live_we_hold {
                             Some(
-                                "BUY skipped: we hold long but target has no position \
-                                 (likely closing their short)"
-                                    .to_string(),
+                                "BUY skipped: wallet holding is outside this copier's ledger"
+                                    .into(),
                             )
                         } else {
-                            None // Fresh long entry Р В Р вЂ Р Р†Р вЂљР’В Р Р†Р вЂљРІвЂћСћ copy
+                            None // Each distinct fill may add another owned source lot.
                         }
                     }
                     // ---- SELL ----------------------------------------------
                     TradeSide::SELL => {
                         if live_we_hold {
-                            match &ledger_entry {
-                                Some(entry) if entry.source_wallet == event.taker_address => {
+                            let source_owns_shares = {
+                                let ledger = copy_ledger.lock().await;
+                                ledger.active_size_for_source(&event.token_id, &event.taker_address)
+                                    > Decimal::ZERO
+                            };
+                            match (&ledger_entry, source_owns_shares) {
+                                (Some(_), true) => {
                                     None // Correct source is selling Р В Р вЂ Р Р†Р вЂљР’В Р Р†Р вЂљРІвЂћСћ close
                                 }
-                                Some(entry) => Some(format!(
+                                (Some(entry), false) => Some(format!(
                                     "SELL skipped: {} sold but we copied from {} Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ \
                                      keeping position",
                                     &event.taker_address[..event.taker_address.len().min(10)],
                                     &entry.source_wallet[..entry.source_wallet.len().min(10)],
                                 )),
-                                None => {
+                                (None, _) => {
                                     warn!(
                                         "SELL: we hold token {} with no ledger entry Р В Р вЂ Р В РІР‚С™Р Р†Р вЂљРЎСљ \
                                          closing defensively.",
@@ -768,50 +861,72 @@ pub fn start_strategy_engine_with_fees(
             if eval.validated {
                 info!("Trade Validated: {:?}", eval.original_event);
 
-                let fee_rate = if config.is_sim {
-                    if let Some((rate, _)) = fee_cache
+                let cached_fee_rate = if config.is_sim {
+                    fee_cache
                         .get(&event.token_id)
                         .filter(|(_, at)| at.elapsed().as_secs() < 60)
-                    {
-                        *rate
-                    } else {
-                        match fee_query(event.token_id.clone()).await {
-                            Ok(rate) => {
-                                if fee_cache.len() >= 20000 {
-                                    fee_cache.clear();
-                                }
-                                fee_cache.insert(event.token_id.clone(), (rate, Instant::now()));
-                                rate
-                            }
-                            Err(e) => {
-                                state.write().await.push_evaluated_trade(EvaluatedTrade {
-                                    original_event: event.clone(),
-                                    validated: false,
-                                    reason: Some(format!("Paper fee schedule unavailable: {e}")),
-                                });
-                                continue;
-                            }
-                        }
-                    }
+                        .map(|(rate, _)| *rate)
                 } else {
-                    // Live accounting uses actual finalized fees. Reserve the current
-                    // highest published taker coefficient until the receipt arrives.
-                    Decimal::new(7, 2)
+                    None
                 };
+                // Start the independent fee lookup now. For paper BUYs it runs while
+                // the CLOB order-book request is in flight instead of adding a second
+                // network round trip to the signal-to-order path.
+                let mut pending_fee_rate = if config.is_sim && cached_fee_rate.is_none() {
+                    let query = fee_query.clone();
+                    let token = event.token_id.clone();
+                    Some(tokio::spawn(async move { query(token).await }))
+                } else {
+                    None
+                };
+                let mut fee_rate = cached_fee_rate.unwrap_or_else(|| {
+                    if config.is_sim {
+                        Decimal::ZERO // replaced by the pending paper lookup before accounting
+                    } else {
+                        // Reserve the current highest published live taker coefficient.
+                        Decimal::new(7, 2)
+                    }
+                });
 
                 let is_closing = event.side == TradeSide::SELL;
+                // This opt-in is set only for the VPS paper experiment. Tests and
+                // other simulation runs keep the regular target-price behavior.
+                let fixed_budget_buy = event.side == TradeSide::BUY
+                    && matches!(
+                        config.sizing_mode,
+                        SizingMode::Fixed | SizingMode::BankScaled
+                    );
+                let paper_buy_cap = if config.is_sim && event.side == TradeSide::BUY {
+                    std::env::var("PAPER_COPY_MAX_PRICE")
+                        .ok()
+                        .and_then(|value| Decimal::from_str(&value).ok())
+                        .filter(|price| (Decimal::new(1, 2)..=Decimal::new(99, 2)).contains(price))
+                        .or_else(|| fixed_budget_buy.then_some(config.max_entry_price))
+                } else {
+                    None
+                };
 
                 // Determine limit price: rounded to 2dp (CLOB tick), capped to [0.01, 0.99]
-                let limit_price =
-                    calculate_limit_price(event.price, event.side, config.max_slippage_pct);
-                let allowed = match event.side {
-                    TradeSide::BUY => {
-                        limit_price <= event.price * (Decimal::ONE + config.max_slippage_pct)
-                    }
-                    TradeSide::SELL => {
-                        limit_price >= event.price * (Decimal::ONE - config.max_slippage_pct)
-                    }
-                };
+                let mut limit_price = paper_buy_cap
+                    .or_else(|| fixed_budget_buy.then_some(config.max_entry_price))
+                    .unwrap_or_else(|| {
+                        calculate_limit_price(event.price, event.side, config.max_slippage_pct)
+                    });
+                let is_sweep_exit =
+                    paper_source_lots && event.transaction_hash.starts_with("sweep_");
+                let is_profit_exit =
+                    is_sweep_exit && event.transaction_hash.starts_with("sweep_profit_");
+                let allowed = is_sweep_exit
+                    || paper_buy_cap.is_some()
+                    || fixed_budget_buy
+                    || match event.side {
+                        TradeSide::BUY => {
+                            limit_price <= event.price * (Decimal::ONE + config.max_slippage_pct)
+                        }
+                        TradeSide::SELL => {
+                            limit_price >= event.price * (Decimal::ONE - config.max_slippage_pct)
+                        }
+                    };
                 if !allowed {
                     state.write().await.push_evaluated_trade(EvaluatedTrade {
                         original_event: event.clone(),
@@ -821,10 +936,13 @@ pub fn start_strategy_engine_with_fees(
                     continue;
                 }
 
+                // Keep the simulated book reservation provisional until the
+                // paper submitter accepts the order. Any later skip or error
+                // drops it and returns that liquidity to the paper book.
+                let mut paper_reservation: Option<crate::simulation::PaperBuyFill> = None;
                 let order: Option<(OrderRequest, Decimal)> = if is_closing {
-                    // Apply the configured inventory buffer to our owned shares.
-                    // Fees still come out of sale proceeds; residual shares stay
-                    // active in the ledger until a later exit or redemption.
+                    // Sell only the copied allocation of this leader. The $5
+                    // budget applies to entries, never to exits.
                     let our_held_size = {
                         let guard = state.read().await;
                         guard
@@ -836,23 +954,58 @@ pub fn start_strategy_engine_with_fees(
 
                     let our_held_size = if crate::execution_journal::active() {
                         let ledger = copy_ledger.lock().await;
-                        our_held_size.min(
-                            ledger
-                                .find_active_for_token(&event.token_id)
-                                .and_then(|e| e.filled_size)
-                                .unwrap_or(Decimal::ZERO),
-                        )
+                        let owned: Decimal = ledger
+                            .entries
+                            .iter()
+                            .filter(|e| !e.closed && e.token_id == event.token_id)
+                            .map(|e| e.filled_size.unwrap_or(e.size))
+                            .sum();
+                        our_held_size.min(owned)
                     } else {
                         our_held_size
                     };
-                    let scalar = config
-                        .target_scalars
-                        .get(&event.taker_address)
-                        .copied()
-                        .unwrap_or(Decimal::ONE);
-                    let desired = if proportional_paper {
-                        (event.size * scalar).min(our_held_size)
+                    let source_shares = {
+                        let ledger = copy_ledger.lock().await;
+                        ledger.active_size_for_source(&event.token_id, &event.taker_address)
+                    };
+                    let desired = if is_sweep_exit {
+                        // The sweep represents a confirmed full source exit, so
+                        // close this source's remaining lot.
+                        source_shares.min(our_held_size)
+                    } else if proportional_paper {
+                        let scalar = config
+                            .target_scalars
+                            .get(&event.taker_address)
+                            .copied()
+                            .unwrap_or(Decimal::ONE);
+                        (event.size * scalar).min(source_shares).min(our_held_size)
+                    } else if source_shares > Decimal::ZERO {
+                        let guard = state.read().await;
+                        let target_shares = guard
+                            .target_positions
+                            .iter()
+                            .find(|p| {
+                                p.token_id == event.token_id
+                                    && p.source_wallet == event.taker_address
+                            })
+                            .map(|p| p.size);
+                        let signal_age = chrono::Utc::now()
+                            .timestamp()
+                            .saturating_sub(event.timestamp)
+                            .max(0) as u64;
+                        let snapshot_after_signal = guard
+                            .last_scan_at
+                            .is_some_and(|at| at.elapsed().as_secs() < signal_age);
+                        proportional_source_exit(
+                            source_shares,
+                            event.size,
+                            target_shares,
+                            snapshot_after_signal,
+                        )
+                        .min(our_held_size)
                     } else {
+                        // Legacy untracked live holdings keep their defensive
+                        // buffer until they can be reconciled to a source.
                         our_held_size * config.sell_fee_buffer
                     };
                     let truncated_size = desired.trunc_with_scale(2);
@@ -863,12 +1016,64 @@ pub fn start_strategy_engine_with_fees(
                         guard
                             .rejection_reasons
                             .insert(event.token_id.clone(), msg.clone());
-                        guard.live_feed.push_front(EvaluatedTrade {
+                        guard.push_evaluated_trade(EvaluatedTrade {
                             original_event: event.clone(),
                             validated: false,
                             reason: Some(msg),
                         });
                         None
+                    } else if config.is_sim {
+                        // Paper SELLs must face the same bid liquidity as live
+                        // orders. Source exits use the signal's limit floor;
+                        // protective sweeps keep their existing floor policy.
+                        let floor = if is_sweep_exit {
+                            is_profit_exit.then(|| {
+                                (event.price * (Decimal::ONE - config.max_slippage_pct))
+                                    .round_dp_with_strategy(
+                                        2,
+                                        rust_decimal::RoundingStrategy::ToZero,
+                                    )
+                                    .max(Decimal::new(1, 2))
+                            })
+                        } else {
+                            Some(limit_price)
+                        };
+                        match paper_sell_query(event.token_id.clone(), truncated_size, floor).await
+                        {
+                            Ok(Some(fill)) => {
+                                info!("Paper SELL: filled {:.4}/{:.4} shares against public bids at average ${:.4}", fill.shares, truncated_size, fill.average_price);
+                                let order = Some((
+                                    OrderRequest {
+                                        token_id: event.token_id.clone(),
+                                        price: fill.average_price,
+                                        size: fill.shares,
+                                        side: event.side,
+                                        budget_usd: None,
+                                    },
+                                    Decimal::ZERO,
+                                ));
+                                paper_reservation = Some(fill);
+                                order
+                            }
+                            Ok(None) => {
+                                state.write().await.push_evaluated_trade(EvaluatedTrade {
+                                    original_event: event.clone(),
+                                    validated: false,
+                                    reason: Some(
+                                        "Paper SELL not filled: no public bids available".into(),
+                                    ),
+                                });
+                                None
+                            }
+                            Err(error) => {
+                                state.write().await.push_evaluated_trade(EvaluatedTrade {
+                                    original_event: event.clone(),
+                                    validated: false,
+                                    reason: Some(format!("Paper SELL book unavailable: {error}")),
+                                });
+                                None
+                            }
+                        }
                     } else {
                         Some((
                             OrderRequest {
@@ -876,12 +1081,13 @@ pub fn start_strategy_engine_with_fees(
                                 price: limit_price,
                                 size: truncated_size,
                                 side: event.side,
+                                budget_usd: None,
                             },
                             Decimal::ZERO,
                         ))
                     }
                 } else {
-                    // -- BUY: size according to active SizingMode, capped and $5 floored --
+                    // -- BUY: size according to the active mode and venue minimum --
                     let current_balance = {
                         let guard = state.read().await;
                         guard.total_balance
@@ -901,6 +1107,50 @@ pub fn start_strategy_engine_with_fees(
                         config.max_trade_size_usd,
                         target_notional,
                     );
+                    if budget_usd <= Decimal::ZERO {
+                        let reason = if config.sizing_mode == SizingMode::BankScaled {
+                            let coefficient = config.copy_size_pct.unwrap_or(Decimal::ZERO);
+                            let desired = if target_notional <= Decimal::from(10) {
+                                target_notional
+                            } else {
+                                target_notional * coefficient
+                            };
+                            if desired < MIN_ORDER_USD {
+                                format!(
+                                    "BUY skipped: source ${target_notional:.2} gives ${desired:.2} at the configured copy ratio, below the ${MIN_ORDER_USD} order minimum"
+                                )
+                            } else {
+                                format!(
+                                    "BUY skipped: ${desired:.2} intended copy exceeds available cash (including fee headroom)"
+                                )
+                            }
+                        } else {
+                            format!(
+                                "BUY skipped: source notional ${target_notional:.2} cannot be copied within the available cash and order minimum"
+                            )
+                        };
+                        state.write().await.push_evaluated_trade(EvaluatedTrade {
+                            original_event: event.clone(),
+                            validated: false,
+                            reason: Some(reason),
+                        });
+                        continue;
+                    }
+                    if fixed_budget_buy {
+                        match affordable_buy_limit(budget_usd, limit_price) {
+                            Some(affordable_limit) => limit_price = affordable_limit,
+                            None => {
+                                state.write().await.push_evaluated_trade(EvaluatedTrade {
+                                    original_event: event.clone(),
+                                    validated: false,
+                                    reason: Some(format!(
+                                        "BUY skipped: ${budget_usd:.2} budget cannot request the Polymarket minimum of 5 shares at any valid price"
+                                    )),
+                                });
+                                continue;
+                            }
+                        }
+                    }
                     // Budget exactly reflects the sizing engine's mathematical intent.
                     // (TargetUSD mirrors natively, Scalars scale natively, Fixed/SelfPct override natively)
                     let raw_size = if proportional_paper {
@@ -908,17 +1158,38 @@ pub fn start_strategy_engine_with_fees(
                         // never silently shrink the requested fraction of the fill.
                         (event.size * wallet_scalar).min(config.max_trade_size_usd / limit_price)
                     } else {
+                        // For a fixed budget this is only a conservative risk
+                        // estimate. Paper sweeps asks and live signs a USDC
+                        // market amount; neither uses this as an order size.
                         budget_usd / limit_price
                     };
-                    let buy_size =
-                        raw_size.round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero);
+                    let share_precision = if proportional_paper { 6 } else { 2 };
+                    let mut buy_size = raw_size.round_dp_with_strategy(
+                        share_precision,
+                        rust_decimal::RoundingStrategy::ToZero,
+                    );
+                    let mut buy_price = limit_price;
 
-                    // CLOB hard minimum: 5 shares. Orders below this always 400.
-                    if buy_size <= Decimal::ZERO
-                        || (!proportional_paper && buy_size < MIN_ORDER_SHARES)
-                    {
+                    if proportional_paper && buy_size <= Decimal::ZERO {
                         let msg = format!(
-                            "BUY skipped: {:.2} shares < CLOB minimum of 5 shares (budget=${:.2})",
+                            "BUY skipped: copied size rounds below 0.000001 shares (raw {:.8}; target scale {:.3}%)",
+                            raw_size,
+                            wallet_scalar * Decimal::from(100)
+                        );
+                        state.write().await.push_evaluated_trade(EvaluatedTrade {
+                            original_event: event.clone(),
+                            validated: false,
+                            reason: Some(msg),
+                        });
+                        continue;
+                    }
+
+                    // Match the CLOB's five-share minimum in paper mode too. A
+                    // smaller proportional lot would appear filled in simulation
+                    // while the identical live order is rejected by Polymarket.
+                    if !fixed_budget_buy && buy_size < MIN_ORDER_SHARES {
+                        let msg = format!(
+                            "BUY skipped: {:.6} shares below Polymarket minimum of 5 shares (budget=${:.2})",
                             buy_size, budget_usd
                         );
                         warn!("{}", msg);
@@ -926,19 +1197,161 @@ pub fn start_strategy_engine_with_fees(
                         guard
                             .rejection_reasons
                             .insert(event.token_id.clone(), msg.clone());
-                        guard.live_feed.push_front(EvaluatedTrade {
+                        guard.push_evaluated_trade(EvaluatedTrade {
+                            original_event: event.clone(),
+                            validated: false,
+                            reason: Some(msg),
+                        });
+                        continue;
+                    }
+
+                    if paper_buy_cap.is_some() && !proportional_paper {
+                        if let Some(task) = pending_fee_rate.take() {
+                            match task.await {
+                                Ok(Ok(rate)) => {
+                                    fee_rate = rate;
+                                    if fee_cache.len() >= 20000 {
+                                        fee_cache.clear();
+                                    }
+                                    fee_cache
+                                        .insert(event.token_id.clone(), (rate, Instant::now()));
+                                }
+                                Ok(Err(e)) => {
+                                    state.write().await.push_evaluated_trade(EvaluatedTrade {
+                                        original_event: event.clone(),
+                                        validated: false,
+                                        reason: Some(format!(
+                                            "Paper fee schedule unavailable: {e}"
+                                        )),
+                                    });
+                                    continue;
+                                }
+                                Err(e) => {
+                                    state.write().await.push_evaluated_trade(EvaluatedTrade {
+                                        original_event: event.clone(),
+                                        validated: false,
+                                        reason: Some(format!("Paper fee lookup failed: {e}")),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+
+                    if paper_buy_cap.is_some() {
+                        let max_price = limit_price;
+                        let paper_fill = if proportional_paper {
+                            crate::simulation::paper_buy_ladder(
+                                &event.token_id,
+                                buy_size,
+                                max_price,
+                            )
+                            .await
+                        } else {
+                            crate::simulation::paper_buy_budget_ladder(
+                                &event.token_id,
+                                budget_usd,
+                                max_price,
+                                fee_rate,
+                            )
+                            .await
+                        };
+                        match paper_fill {
+                            Ok(Some(fill)) => {
+                                buy_size = fill.shares;
+                                buy_price = fill.average_price;
+                                info!(
+                                    "Paper FAK ladder: filled {:.2} shares for a ${:.2} budget, average ${:.4}, cap ${:.2}; remainder canceled",
+                                    fill.shares, budget_usd, fill.average_price, max_price
+                                );
+                                paper_reservation = Some(fill);
+                            }
+                            Ok(None) => {
+                                state.write().await.push_evaluated_trade(EvaluatedTrade {
+                                    original_event: event.clone(),
+                                    validated: false,
+                                    reason: Some(format!("Paper BUY skipped: no asks available at or below ${max_price:.2}")),
+                                });
+                                continue;
+                            }
+                            Err(e) => {
+                                state.write().await.push_evaluated_trade(EvaluatedTrade {
+                                    original_event: event.clone(),
+                                    validated: false,
+                                    reason: Some(format!("Paper order book unavailable: {e}")),
+                                });
+                                continue;
+                            }
+                        }
+                    }
+
+                    // A partial fill may leave fewer than five shares, but the
+                    // submitted order itself must satisfy the minimum above.
+                    if buy_size <= Decimal::ZERO {
+                        let msg =
+                            format!("BUY skipped: no shares filled (budget=${:.2})", budget_usd);
+                        warn!("{}", msg);
+                        let mut guard = state.write().await;
+                        guard
+                            .rejection_reasons
+                            .insert(event.token_id.clone(), msg.clone());
+                        guard.push_evaluated_trade(EvaluatedTrade {
                             original_event: event.clone(),
                             validated: false,
                             reason: Some(msg),
                         });
                         None
                     } else {
+                        if let Some(task) = pending_fee_rate.take() {
+                            match task.await {
+                                Ok(Ok(rate)) => {
+                                    fee_rate = rate;
+                                    if fee_cache.len() >= 20000 {
+                                        fee_cache.clear();
+                                    }
+                                    fee_cache
+                                        .insert(event.token_id.clone(), (rate, Instant::now()));
+                                }
+                                Ok(Err(e)) => {
+                                    state.write().await.push_evaluated_trade(EvaluatedTrade {
+                                        original_event: event.clone(),
+                                        validated: false,
+                                        reason: Some(format!(
+                                            "Paper fee schedule unavailable: {e}"
+                                        )),
+                                    });
+                                    continue;
+                                }
+                                Err(e) => {
+                                    state.write().await.push_evaluated_trade(EvaluatedTrade {
+                                        original_event: event.clone(),
+                                        validated: false,
+                                        reason: Some(format!("Paper fee lookup failed: {e}")),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
                         // Pre-check balance taking the maximum CTF fee overhead into account
                         // Reserve paper's current market fee / conservative live overhead.
-                        let p = limit_price;
+                        let p = buy_price;
                         let max_ctf_fee = crate::fees::taker_fee(buy_size, p, fee_rate);
-                        let order_cost = buy_size * limit_price;
-                        let total_cost = order_cost + max_ctf_fee;
+                        let order_cost = buy_size * p;
+                        let total_cost = if fixed_budget_buy && !config.is_sim {
+                            // The live FAK builder signs a USDC amount and keeps
+                            // taker fees inside this total budget.
+                            budget_usd
+                        } else {
+                            order_cost + max_ctf_fee
+                        };
+                        if fixed_budget_buy && config.is_sim && total_cost > budget_usd {
+                            state.write().await.push_evaluated_trade(EvaluatedTrade {
+                                original_event: event.clone(),
+                                validated: false,
+                                reason: Some("Paper fill exceeds the fee-inclusive budget".into()),
+                            });
+                            continue;
+                        }
 
                         if current_balance < total_cost {
                             let msg = format!(
@@ -950,7 +1363,7 @@ pub fn start_strategy_engine_with_fees(
                             guard
                                 .rejection_reasons
                                 .insert(event.token_id.clone(), msg.clone());
-                            guard.live_feed.push_front(EvaluatedTrade {
+                            guard.push_evaluated_trade(EvaluatedTrade {
                                 original_event: event.clone(),
                                 validated: false,
                                 reason: Some(msg),
@@ -969,7 +1382,7 @@ pub fn start_strategy_engine_with_fees(
                                 guard
                                     .rejection_reasons
                                     .insert(event.token_id.clone(), msg.clone());
-                                guard.live_feed.push_front(EvaluatedTrade {
+                                guard.push_evaluated_trade(EvaluatedTrade {
                                     original_event: event.clone(),
                                     validated: false,
                                     reason: Some(msg),
@@ -979,9 +1392,11 @@ pub fn start_strategy_engine_with_fees(
                                 Some((
                                     OrderRequest {
                                         token_id: event.token_id.clone(),
-                                        price: limit_price,
+                                        price: buy_price,
                                         size: buy_size,
                                         side: event.side,
+                                        budget_usd: (fixed_budget_buy && !config.is_sim)
+                                            .then_some(budget_usd),
                                     },
                                     total_cost,
                                 ))
@@ -989,6 +1404,42 @@ pub fn start_strategy_engine_with_fees(
                         }
                     }
                 };
+
+                if let Some(task) = pending_fee_rate.take() {
+                    match task.await {
+                        Ok(Ok(rate)) => {
+                            fee_rate = rate;
+                            if fee_cache.len() >= 20000 {
+                                fee_cache.clear();
+                            }
+                            fee_cache.insert(event.token_id.clone(), (rate, Instant::now()));
+                        }
+                        Ok(Err(e)) => {
+                            if event.side == TradeSide::SELL {
+                                warn!("Paper SELL fee schedule unavailable; applying zero fee and recording the fee uncertainty: {e}");
+                            } else {
+                                state.write().await.push_evaluated_trade(EvaluatedTrade {
+                                    original_event: event.clone(),
+                                    validated: false,
+                                    reason: Some(format!("Paper fee schedule unavailable: {e}")),
+                                });
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            if event.side == TradeSide::SELL {
+                                warn!("Paper SELL fee lookup failed; applying zero fee and recording the fee uncertainty: {e}");
+                            } else {
+                                state.write().await.push_evaluated_trade(EvaluatedTrade {
+                                    original_event: event.clone(),
+                                    validated: false,
+                                    reason: Some(format!("Paper fee lookup failed: {e}")),
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                }
 
                 if let Some((order, cost_to_deduct)) = order {
                     let mut execution = event.clone();
@@ -1034,6 +1485,7 @@ pub fn start_strategy_engine_with_fees(
                     let state_clone = state.clone();
                     let token_id_clone = order.token_id.clone();
                     let source_wallet_clone = event.taker_address.clone();
+                    let source_notional_usd = event.size * event.price;
                     let is_closing = event.side == TradeSide::SELL;
                     let order_size = order.size;
                     let order_price = order.price;
@@ -1042,9 +1494,7 @@ pub fn start_strategy_engine_with_fees(
                     // Capture entry_price from ledger BEFORE spawning for realized PnL.
                     let entry_price = if is_closing {
                         let ledger = copy_ledger.lock().await;
-                        ledger
-                            .find_active_for_token(&event.token_id)
-                            .map(|e| e.entry_price)
+                        ledger.average_price_for_source(&event.token_id, &event.taker_address)
                     } else {
                         None
                     };
@@ -1066,6 +1516,9 @@ pub fn start_strategy_engine_with_fees(
                         crate::execution_journal::clear_source(&token_id_clone);
                         match submitted {
                             Ok(()) => {
+                                if let Some(fill) = &mut paper_reservation {
+                                    fill.commit_reservation();
+                                }
                                 crate::latency::accepted(&latency_event);
                                 let mut ledger = ledger_clone.lock().await;
                                 if is_sim {
@@ -1078,27 +1531,41 @@ pub fn start_strategy_engine_with_fees(
                                             order_price,
                                             fee_rate,
                                         );
-                                        match crate::simulation::sell(
-                                            &mut guard,
+                                        let source_basis = ledger.sale_cost_basis(
                                             &token_id_clone,
+                                            &source_wallet_clone,
                                             order_size,
-                                            order_price,
-                                            fee,
-                                        ) {
+                                        );
+                                        let sale_result = if let Some(source_basis) = source_basis {
+                                            crate::simulation::sell_with_cost_basis(
+                                                &mut guard,
+                                                &token_id_clone,
+                                                order_size,
+                                                order_price,
+                                                fee,
+                                                source_basis,
+                                            )
+                                        } else {
+                                            Err(anyhow::anyhow!(
+                                                "source lots do not cover paper SELL"
+                                            ))
+                                        };
+                                        match sale_result {
                                             Ok(outcome) => {
+                                                if let Err(e) = ledger.record_source_sale(
+                                                    &token_id_clone,
+                                                    &source_wallet_clone,
+                                                    order_size,
+                                                    order_price,
+                                                    fee,
+                                                ) {
+                                                    guard.started = true;
+                                                    guard.paper_integrity_fault = true;
+                                                    accounted = false;
+                                                    tracing::error!("Paper source PnL attribution failed; execution paused: {e}");
+                                                }
                                                 if let Some(pnl) = outcome {
-                                                    ledger.record_close(
-                                                        &token_id_clone,
-                                                        &source_wallet_clone,
-                                                    );
                                                     closed_outcome = Some(pnl);
-                                                } else if let Some(position) =
-                                                    guard.positions.get(&token_id_clone)
-                                                {
-                                                    ledger.update_fill(
-                                                        &token_id_clone,
-                                                        position.size,
-                                                    );
                                                 }
                                             }
                                             Err(e) => {
@@ -1134,21 +1601,18 @@ pub fn start_strategy_engine_with_fees(
                                         if previous.is_none() {
                                             guard.paper_cycle_pnl.remove(&token_id_clone);
                                         }
-                                        if previous.is_some() {
-                                            ledger.update_paper_position(
-                                                &token_id_clone,
-                                                total_size,
-                                                average_entry_price,
-                                            );
-                                        } else {
-                                            ledger.record_copy(
-                                                token_id_clone.clone(),
-                                                source_wallet_clone.clone(),
-                                                order_size,
-                                                average_entry_price,
-                                            );
+                                        if let Err(e) = ledger.record_filled_copy_with_source(
+                                            token_id_clone.clone(),
+                                            source_wallet_clone.clone(),
+                                            order_size,
+                                            cost_to_deduct / order_size,
+                                            source_notional_usd,
+                                        ) {
+                                            guard.started = true;
+                                            guard.paper_integrity_fault = true;
+                                            accounted = false;
+                                            tracing::error!("Paper BUY ledger persistence failed; execution paused: {e}");
                                         }
-                                        ledger.update_fill(&token_id_clone, total_size);
                                     }
                                     guard.pending_orders.remove(&token_id_clone);
                                     guard.unrealized_pnl = guard
@@ -1170,7 +1634,9 @@ pub fn start_strategy_engine_with_fees(
                                             latency_event.timestamp,
                                         );
                                     }
-                                    let saved = if ledger.is_persistent() {
+                                    let saved = if guard.paper_integrity_fault {
+                                        Err(anyhow::anyhow!("Paper ledger needs reconciliation"))
+                                    } else if ledger.is_persistent() {
                                         crate::simulation::commit(&mut guard)
                                     } else {
                                         guard.paper_committed_outcomes = guard.paper_outcomes.len();
@@ -1178,6 +1644,7 @@ pub fn start_strategy_engine_with_fees(
                                     };
                                     if let Err(e) = saved {
                                         guard.started = true;
+                                        guard.paper_integrity_fault = true;
                                         tracing::error!(
                                             "Paper fill persistence failed; execution paused: {e}"
                                         );
@@ -1262,4 +1729,19 @@ pub fn start_strategy_engine_with_fees(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod proportional_copy_size_tests {
+    use super::*;
+
+    #[test]
+    fn paper_copy_preserves_sub_cent_share_precision_without_changing_live_precision() {
+        let paper_size = Decimal::new(54_945, 7)
+            .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToZero);
+        let live_size = Decimal::new(54_945, 7)
+            .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToZero);
+        assert_eq!(paper_size, Decimal::new(5_494, 6));
+        assert_eq!(live_size, Decimal::ZERO);
+    }
 }

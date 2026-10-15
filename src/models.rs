@@ -18,6 +18,10 @@ pub enum SizingMode {
     /// Scale the target's exact dollar notional by their wallet-specific scalar
     /// (e.g. `0xABC:0.01` means multiply target notional by 0.01).
     TargetScalar,
+    /// Mirror source buys through $10, then use the larger of $10 and a
+    /// configured fraction of the full source notional, subject to the trade cap.
+    /// The resulting USDC budget includes taker fees.
+    BankScaled,
 }
 
 impl SizingMode {
@@ -27,6 +31,7 @@ impl SizingMode {
             Self::SelfPct => "self_pct",
             Self::TargetUsd => "target_usd",
             Self::TargetScalar => "target_scalar",
+            Self::BankScaled => "bank_scaled",
         }
     }
 
@@ -35,6 +40,7 @@ impl SizingMode {
             "self_pct" => Self::SelfPct,
             "target_usd" => Self::TargetUsd,
             "target_scalar" => Self::TargetScalar,
+            "bank_scaled" => Self::BankScaled,
             _ => Self::Fixed,
         }
     }
@@ -58,7 +64,7 @@ pub enum TradeSide {
     SELL,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvaluatedTrade {
     pub original_event: TradeEvent,
     pub validated: bool,
@@ -78,6 +84,11 @@ pub struct OrderRequest {
     pub price: Decimal,
     pub size: Decimal,
     pub side: TradeSide,
+    /// For a BUY FAK order, spend at most this much USDC including taker fees.
+    /// The eventual share count is determined by the order book and can differ
+    /// from `size`, which is only an internal risk estimate in this mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

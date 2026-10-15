@@ -1,40 +1,50 @@
 [Unit]
-Description=Polycopier — Automated Polymarket Copy Trading Bot
-Documentation=https://github.com/cbaezp/polycopier
-After=network-online.target
-Wants=network-online.target
+Description=Polycopier isolated live trading service
+After=network-online.target polycopier-preview.service
+Wants=network-online.target polycopier-preview.service
 
 [Service]
 Type=simple
-# Run as a dedicated low-privilege user (create with: useradd -r -s /bin/false polycopier)
 User=polycopier
 Group=polycopier
-
-# All paths relative to the working directory.
-# The .env file must live here.
-WorkingDirectory=/opt/polycopier
-
-# --headless: skip the TUI, log to stdout (captured by journald)
-ExecStart=/opt/polycopier/polycopier --headless
-
-# Restart automatically on crash or OOM kill.
+WorkingDirectory=/opt/polycopier-live
+EnvironmentFile=/opt/polycopier-live/.env
+Environment=POLYCOPIER_MODE=live
+Environment=RISK_STATE_PATH=/opt/polycopier-live/runtime-risk.json
+Environment=DASHBOARD_BIND=127.0.0.1:3001
+Environment=RUST_LOG=polycopier=info,warn
+ExecCondition=/usr/bin/python3 /opt/polycopier/deploy/verify-live-stage.py --prestart
+ExecStart=/opt/polycopier-live/polycopier --ui-reboot
 Restart=on-failure
-RestartSec=10s
-
-# Give the bot 30s to finish any in-flight orders on SIGTERM.
+RestartSec=8
 TimeoutStopSec=30
-
-# Send logs to journald (view with: journalctl -u polycopier -f)
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/polycopier-live
+PrivateTmp=true
+PrivateDevices=true
+ProtectClock=true
+ProtectKernelLogs=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RemoveIPC=true
+MemoryMax=512M
+CPUQuota=100%
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=polycopier
-
-# Security hardening
-NoNewPrivileges=true
-ProtectSystem=strict
-# The bot needs to write .env when settings change via [s] at restart
-ReadWritePaths=/opt/polycopier
-PrivateTmp=true
+SyslogIdentifier=polycopier-live
 
 [Install]
 WantedBy=multi-user.target

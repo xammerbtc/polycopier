@@ -16,6 +16,29 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashSet;
 
+#[test]
+fn partial_source_sale_is_proportional_and_unrelated_lots_are_untouched() {
+    use polycopier::strategy::proportional_source_exit;
+    // Leader held 100 shares and sold 20; our $5 entry owns 8.33 shares.
+    assert_eq!(
+        proportional_source_exit(dec!(8.33), dec!(20), Some(dec!(100)), false),
+        dec!(1.666)
+    );
+    // A scanner snapshot taken after the sale shows 80 remaining shares.
+    assert_eq!(
+        proportional_source_exit(dec!(8.33), dec!(20), Some(dec!(80)), true),
+        dec!(1.666)
+    );
+    assert_eq!(
+        proportional_source_exit(dec!(8.33), dec!(100), Some(dec!(100)), false),
+        dec!(8.33)
+    );
+    assert_eq!(
+        proportional_source_exit(dec!(8.33), dec!(20), None, false),
+        dec!(8.33)
+    );
+}
+
 // -- Shared test helpers -------------------------------------------------------
 
 fn test_config() -> polycopier::config::Config {
@@ -28,6 +51,7 @@ fn test_config() -> polycopier::config::Config {
         max_slippage_pct: dec!(0.02),
         max_trade_size_usd: dec!(10.00),
         max_delay_seconds: 2,
+        max_buy_delay_seconds: None,
         max_copy_loss_pct: dec!(0.40),
         max_copy_gain_pct: dec!(0.05),
         min_entry_price: dec!(0.02),
@@ -42,6 +66,8 @@ fn test_config() -> polycopier::config::Config {
         max_daily_volume_usd: dec!(0),
         max_consecutive_losses: 0,
         loss_cooldown_secs: 300,
+        profit_guard_trigger_pct: dec!(0.07),
+        profit_guard_loss_pct: dec!(0.10),
         ignore_closing_in_mins: None,
         is_sim: false,
         sim_balance: None,
@@ -305,6 +331,23 @@ mod state_tests {
         state.push_evaluated_trade(make_eval(false));
         assert_eq!(state.copies_executed, 0);
         assert_eq!(state.trades_skipped, 1);
+    }
+
+    #[test]
+    fn successful_retry_removes_stale_skip_and_corrects_counter() {
+        let mut state = BotState::new(false, None);
+        let mut rejected = make_eval(false);
+        rejected.reason = Some("temporary HTTP 429".into());
+        state.push_evaluated_trade(rejected.clone());
+        assert_eq!(state.trades_skipped, 1);
+
+        rejected.validated = true;
+        rejected.reason = None;
+        state.push_evaluated_trade(rejected);
+        assert_eq!(state.copies_executed, 1);
+        assert_eq!(state.trades_skipped, 0);
+        assert_eq!(state.live_feed.len(), 1);
+        assert!(state.live_feed.front().unwrap().validated);
     }
 
     #[test]
@@ -1051,7 +1094,8 @@ mod strategy_engine_tests {
 
     #[tokio::test]
     async fn valid_trade_from_target_wallet_is_executed() {
-        let config = test_config();
+        let mut config = test_config();
+        config.sizing_mode = SizingMode::TargetUsd;
         let state = Arc::new(RwLock::new(BotState::new(false, None)));
         let risk = RiskEngine::new(config.clone());
         let log: Arc<Mutex<Vec<OrderRequest>>> = Arc::new(Mutex::new(vec![]));
@@ -1148,17 +1192,26 @@ mod strategy_engine_tests {
             .unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
 
-        let orders = log.lock().unwrap();
-        assert_eq!(orders.len(), 1);
-        let notional = orders[0].size * orders[0].price;
+        let (orders_len, notional) = {
+            let orders = log.lock().unwrap();
+            (
+                orders.len(),
+                orders
+                    .first()
+                    .map(|order| order.size * order.price)
+                    .unwrap_or_default(),
+            )
+        };
+        assert_eq!(orders_len, 1);
         assert!(notional <= dec!(10));
         assert!(notional > dec!(9.99));
     }
 
     #[tokio::test]
-    async fn micro_trade_rejected_by_risk_engine() {
+    async fn fixed_copy_executes_small_target_trade_with_configured_order_size() {
         let config = test_config();
         let state = Arc::new(RwLock::new(BotState::new(false, None)));
+        state.write().await.total_balance = dec!(100);
         let risk = RiskEngine::new(config.clone());
         let log: Arc<Mutex<Vec<OrderRequest>>> = Arc::new(Mutex::new(vec![]));
         let (tx, rx) = mpsc::channel::<TradeEvent>(10);
@@ -1173,14 +1226,21 @@ mod strategy_engine_tests {
             make_no_op_end_date_query(),
         );
 
-        // $0.05 * 0.01 = $0.0005 - below $1 spoofing threshold
+        // The leader's $0.0005 fill is only a signal; Fixed mode sizes our order
+        // from our configured budget instead of rejecting the leader's tiny fill.
         tx.send(make_trade("0xabc", dec!(0.05), dec!(0.01), TradeSide::BUY))
             .await
             .unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
 
-        assert!(log.lock().unwrap().is_empty());
-        assert_eq!(state.read().await.trades_skipped, 1);
+        let notional = {
+            let orders = log.lock().unwrap();
+            assert_eq!(orders.len(), 1);
+            orders[0].size * orders[0].price
+        };
+        assert!(notional <= dec!(10));
+        assert!(notional > dec!(9.99));
+        assert_eq!(state.read().await.trades_skipped, 0);
     }
 
     #[tokio::test]
@@ -1383,9 +1443,9 @@ mod strategy_engine_tests {
     }
 
     #[tokio::test]
-    async fn buy_skipped_when_target_closing_short_we_are_long() {
-        // We hold a long. Target has NO scanner position -> target is likely
-        // closing a short. Copying this BUY would add to our long incorrectly.
+    async fn buy_skipped_when_wallet_holding_has_no_copier_lot() {
+        // A wallet holding with no matching copier ledger lot must not be
+        // silently attributed to a leader's new BUY signal.
         let config = test_config();
         let mut init_state = BotState::new(false, None);
         init_state.positions.insert(
@@ -1420,7 +1480,7 @@ mod strategy_engine_tests {
 
         assert!(
             log.lock().unwrap().is_empty(),
-            "should skip BUY that looks like short close"
+            "untracked holding must not be copied"
         );
         let guard = state.read().await;
         assert_eq!(guard.trades_skipped, 1);
@@ -1477,11 +1537,9 @@ mod strategy_engine_tests {
     // Ledger-aware tests — these exercise the new copy_ledger + intent logic
     // -----------------------------------------------------------------------
 
-    /// BUY is skipped when the ledger already shows an active copy for that
-    /// token, regardless of which target is now trying to BUY it (one-position-
-    /// per-token rule).
+    /// A second distinct BUY signal may add another lot to an owned token.
     #[tokio::test]
-    async fn buy_skipped_when_ledger_already_holds_token() {
+    async fn buy_adds_to_token_already_held_in_ledger() {
         let config = test_config();
         let mut init_state = BotState::new(false, None);
         init_state.total_balance = dec!(100);
@@ -1523,14 +1581,11 @@ mod strategy_engine_tests {
             .unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
 
-        // Must be skipped — one-position-per-token
+        // Each distinct leader fill is independently copied.
         let order_count = log.lock().unwrap().len();
-        assert_eq!(
-            order_count, 0,
-            "BUY should be skipped when token already in ledger"
-        );
+        assert_eq!(order_count, 1);
         let guard = state.read().await;
-        assert_eq!(guard.trades_skipped, 1);
+        assert_eq!(guard.trades_skipped, 0);
     }
 
     /// A SELL from the CORRECT source wallet (the one we copied from) triggers
@@ -1582,9 +1637,56 @@ mod strategy_engine_tests {
     }
 
     #[tokio::test]
+    async fn partial_sell_uses_only_the_signalling_sources_allocation() {
+        let config = test_config();
+        let mut initial = BotState::new(false, None);
+        initial.total_balance = dec!(100);
+        initial.positions.insert(
+            "99999".into(),
+            Position {
+                token_id: "99999".into(),
+                size: dec!(18.33),
+                average_entry_price: dec!(0.50),
+            },
+        );
+        let mut target = target_pos("99999");
+        target.source_wallet = "0xabc".into();
+        target.size = dec!(100);
+        initial.target_positions.push(target);
+        let state = Arc::new(RwLock::new(initial));
+        let ledger = Arc::new(tokio::sync::Mutex::new({
+            let mut ledger = CopyLedger::new_in_memory();
+            ledger.record_copy("99999".into(), "0xabc".into(), dec!(8.33), dec!(0.50));
+            ledger.record_copy("99999".into(), "0xdef".into(), dec!(10), dec!(0.50));
+            ledger
+        }));
+        let log = Arc::new(Mutex::new(Vec::<OrderRequest>::new()));
+        let (tx, rx) = mpsc::channel(4);
+        start_strategy_engine(
+            rx,
+            state,
+            RiskEngine::new(config.clone()),
+            mock_submitter(log.clone()),
+            config,
+            ledger,
+            make_no_op_holds_query(),
+            make_no_op_end_date_query(),
+        );
+        tx.send(make_trade("0xabc", dec!(0.60), dec!(20), TradeSide::SELL))
+            .await
+            .unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+        let orders = log.lock().unwrap();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].side, TradeSide::SELL);
+        assert_eq!(orders[0].size, dec!(1.66));
+    }
+
+    #[tokio::test]
     async fn paper_buy_carries_current_fee_into_position_and_ledger_basis() {
         let mut config = test_config();
         config.is_sim = true;
+        config.sizing_mode = SizingMode::TargetUsd;
         let state = Arc::new(RwLock::new(BotState::new(true, Some(dec!(200)))));
         let ledger = test_ledger();
         let log = Arc::new(Mutex::new(vec![]));
@@ -1630,7 +1732,7 @@ mod strategy_engine_tests {
     }
 
     #[tokio::test]
-    async fn paper_sell_preserves_fractional_residual_and_accounts_sell_fee() {
+    async fn paper_sell_closes_source_fill_and_preserves_untradeable_fractional_residual() {
         let mut config = test_config();
         config.is_sim = true;
         let mut initial = BotState::new(true, Some(dec!(100)));
@@ -1650,7 +1752,7 @@ mod strategy_engine_tests {
         }));
         let log = Arc::new(Mutex::new(vec![]));
         let (tx, rx) = mpsc::channel(10);
-        polycopier::strategy::start_strategy_engine_with_fees(
+        polycopier::strategy::start_strategy_engine_with_queries(
             rx,
             state.clone(),
             RiskEngine::new(config.clone()),
@@ -1660,6 +1762,15 @@ mod strategy_engine_tests {
             make_no_op_holds_query(),
             make_no_op_end_date_query(),
             Arc::new(|_| Box::pin(async { Ok(dec!(0.02)) })),
+            Arc::new(|_token, shares, floor| {
+                Box::pin(async move {
+                    Ok(polycopier::simulation::match_sell_bids(
+                        &[(dec!(0.59), dec!(100))],
+                        shares,
+                        floor,
+                    ))
+                })
+            }),
         );
         tx.send(make_trade("0xabc", dec!(0.60), dec!(30), TradeSide::SELL))
             .await
@@ -1675,7 +1786,7 @@ mod strategy_engine_tests {
         .await
         .unwrap();
         let guard = state.read().await;
-        assert_eq!(guard.positions["99999"].size, dec!(0.603));
+        assert_eq!(guard.positions["99999"].size, dec!(0.003));
         assert_eq!(
             ledger
                 .lock()
@@ -1683,14 +1794,67 @@ mod strategy_engine_tests {
                 .find_active_for_token("99999")
                 .unwrap()
                 .filled_size,
-            Some(dec!(0.603))
+            Some(dec!(0.003))
         );
-        let fee = (dec!(19.40) * dec!(0.02) * dec!(0.59) * dec!(0.41)).round_dp(5);
-        assert_eq!(
-            guard.total_balance,
-            dec!(100) + dec!(19.40) * dec!(0.59) - fee
+        let fee = (dec!(20) * dec!(0.02) * dec!(0.59) * dec!(0.41)).round_dp(5);
+        assert_eq!(guard.total_balance, dec!(100) + dec!(20) * dec!(0.59) - fee);
+        assert_eq!(guard.realized_pnl, dec!(20) * dec!(0.09) - fee);
+    }
+
+    #[tokio::test]
+    async fn paper_source_sell_without_executable_bid_remains_open() {
+        let mut config = test_config();
+        config.is_sim = true;
+        let mut initial = BotState::new(true, Some(dec!(100)));
+        initial.positions.insert(
+            "99999".into(),
+            Position {
+                token_id: "99999".into(),
+                size: dec!(20),
+                average_entry_price: dec!(0.50),
+            },
         );
-        assert_eq!(guard.realized_pnl, dec!(19.40) * dec!(0.09) - fee);
+        let state = Arc::new(RwLock::new(initial));
+        let ledger = Arc::new(tokio::sync::Mutex::new({
+            let mut ledger = CopyLedger::new_in_memory();
+            ledger.record_copy("99999".into(), "0xabc".into(), dec!(20), dec!(0.50));
+            ledger
+        }));
+        let orders = Arc::new(Mutex::new(vec![]));
+        let (tx, rx) = mpsc::channel(10);
+        polycopier::strategy::start_strategy_engine_with_queries(
+            rx,
+            state.clone(),
+            RiskEngine::new(config.clone()),
+            mock_submitter(orders.clone()),
+            config,
+            ledger,
+            make_no_op_holds_query(),
+            make_no_op_end_date_query(),
+            Arc::new(|_| Box::pin(async { Ok(dec!(0.02)) })),
+            Arc::new(|_token, _shares, _floor| Box::pin(async { Ok(None) })),
+        );
+        tx.send(make_trade("0xabc", dec!(0.60), dec!(30), TradeSide::SELL))
+            .await
+            .unwrap();
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            loop {
+                if state.read().await.live_feed.iter().any(|item| {
+                    item.reason.as_deref()
+                        == Some("Paper SELL not filled: no public bids available")
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(orders.lock().unwrap().is_empty());
+        let guard = state.read().await;
+        assert_eq!(guard.positions["99999"].size, dec!(20));
+        assert_eq!(guard.total_balance, dec!(100));
+        assert_eq!(guard.realized_pnl, Decimal::ZERO);
     }
 
     #[tokio::test]

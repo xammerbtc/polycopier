@@ -6,7 +6,7 @@ use anyhow::Result;
 use chrono::Utc;
 use polymarket_client_sdk::data::types::request::ActivityRequest;
 use polymarket_client_sdk::data::types::{ActivitySortBy, ActivityType, SortDirection};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::str::FromStr;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -16,9 +16,36 @@ const SEEN_HASHES_CAP: usize = 20000;
 pub static LAST_POLL_SUCCESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ACTIVE_TARGETS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
 
+fn fallback_poll_interval(websocket_connected: bool) -> std::time::Duration {
+    if websocket_connected {
+        std::time::Duration::from_secs(15)
+    } else {
+        std::time::Duration::from_secs(5)
+    }
+}
+
+fn target_retry_cooldown(error: &str) -> std::time::Duration {
+    if let Some(retry_after) = error
+        .split("retry-after=")
+        .nth(1)
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.trim_end_matches('s').parse::<u64>().ok())
+    {
+        return std::time::Duration::from_secs(retry_after.clamp(1, 120));
+    }
+    if error.contains("429") {
+        std::time::Duration::from_secs(30)
+    } else if error.contains("503") {
+        std::time::Duration::from_secs(15)
+    } else {
+        std::time::Duration::from_secs(5)
+    }
+}
+
 pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) -> Result<()> {
     let mut config = config.clone();
     let data_client = reqwest::Client::builder()
+        .user_agent("Polycopier/1.0")
         .connect_timeout(std::time::Duration::from_secs(2))
         .timeout(std::time::Duration::from_secs(5))
         .tcp_nodelay(true)
@@ -35,19 +62,31 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
         let mut seen_order: VecDeque<String> = VecDeque::new();
         // Gap 6: track consecutive API errors per target for backoff.
         let mut consecutive_errors: u32 = 0;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
+        let mut target_cooldowns: HashMap<String, std::time::Instant> = HashMap::new();
         loop {
+            let cycle_started = std::time::Instant::now();
             config.hot_reload();
             if let Ok(mut active) = ACTIVE_TARGETS.write() {
                 *active = config.target_wallets.clone();
             }
-            interval.tick().await;
+            let websocket_connected =
+                crate::rtds::CONNECTED.load(std::sync::atomic::Ordering::Relaxed);
 
             let mut had_error = false;
 
-            for target in &config.target_wallets {
+            for (index, target) in config.target_wallets.iter().enumerate() {
+                let target_key = target.to_ascii_lowercase();
+                if target_cooldowns
+                    .get(&target_key)
+                    .is_some_and(|until| *until > std::time::Instant::now())
+                {
+                    continue;
+                }
+                // Spread fallback requests instead of sending one burst for all
+                // wallets. RTDS carries the low-latency path while it is healthy.
+                if index > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
                 let target_addr = match Address::from_str(target) {
                     Ok(addr) => addr,
                     Err(_) => continue,
@@ -59,6 +98,7 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
                         .await
                     {
                         Ok(t) => {
+                            target_cooldowns.remove(&target_key);
                             LAST_POLL_SUCCESS.store(
                                 Utc::now().timestamp() as u64,
                                 std::sync::atomic::Ordering::Relaxed,
@@ -70,9 +110,13 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
                             crate::latency::poll_error();
                             had_error = true;
                             warn!(
-                                "Listener: API error for {}: {e} (consecutive_errors={})",
-                                &target[..target.len().min(10)],
-                                consecutive_errors + 1
+                            "Listener: Data API request failed for {}: {e} (consecutive_errors={})",
+                            &target[..target.len().min(10)],
+                            consecutive_errors + 1
+                        );
+                            target_cooldowns.insert(
+                                target_key,
+                                std::time::Instant::now() + target_retry_cooldown(&e.to_string()),
                             );
                             continue; // skip this target this cycle
                         }
@@ -157,6 +201,16 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
             } else {
                 consecutive_errors = 0; // reset on clean cycle
             }
+
+            // The stream is the primary signal source. Keep the public activity
+            // API as a low-rate recovery sweep while connected; accelerate it
+            // during WebSocket outages. A target-specific cooldown prevents a
+            // 429 from being retried on every cycle. The fixed 5-minute
+            // overlap plus exact fill deduplication closes short polling gaps.
+            let cadence = fallback_poll_interval(websocket_connected);
+            if let Some(remaining) = cadence.checked_sub(cycle_started.elapsed()) {
+                tokio::time::sleep(remaining).await;
+            }
         }
     });
 
@@ -199,13 +253,28 @@ async fn fetch_recent(
     let mut trades = Vec::new();
     let end = Utc::now().timestamp();
     for offset in (0..=10000).step_by(PAGE_SIZE as usize) {
-        let page: Vec<polymarket_client_sdk::data::types::response::Trade> =
-            fresh_request(client, &page_request(wallet, offset, cutoff, end)?)
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
+        let response = fresh_request(client, &page_request(wallet, offset, cutoff, end)?)
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("Data API transport error: {}", error.without_url())
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
+            if let Some(retry_after) = retry_after {
+                anyhow::bail!("Data API returned HTTP {status} retry-after={retry_after}s");
+            }
+            anyhow::bail!("Data API returned HTTP {status}");
+        }
+        let page: Vec<polymarket_client_sdk::data::types::response::Trade> = response
+            .json()
+            .await
+            .map_err(|error| anyhow::anyhow!("Data API JSON error: {}", error.without_url()))?;
         let more = more_pages(
             page.len(),
             page.iter().map(|trade| trade.timestamp).min(),
@@ -237,6 +306,22 @@ fn evict_and_insert(seen: &mut HashSet<String>, order: &mut VecDeque<String>, ha
 #[cfg(test)]
 mod pagination_tests {
     use super::*;
+
+    #[test]
+    fn fallback_polling_slows_when_websocket_is_healthy() {
+        assert_eq!(fallback_poll_interval(true).as_secs(), 15);
+        assert_eq!(fallback_poll_interval(false).as_secs(), 5);
+    }
+
+    #[test]
+    fn fallback_rate_limit_cooldown_is_per_target_and_bounded() {
+        assert_eq!(target_retry_cooldown("HTTP 429").as_secs(), 30);
+        assert_eq!(
+            target_retry_cooldown("HTTP 503 retry-after=180s").as_secs(),
+            120
+        );
+        assert_eq!(target_retry_cooldown("transport error").as_secs(), 5);
+    }
 
     #[test]
     fn request_includes_all_trade_activity_and_window() {

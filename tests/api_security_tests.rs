@@ -12,8 +12,9 @@ async fn dashboard_requires_authentication_and_never_returns_key() {
     let token = "a-test-only-token-with-at-least-24-characters";
     std::env::set_var("DASHBOARD_TOKEN", token);
     std::env::set_var("PRIVATE_KEY", "test-secret-must-never-appear");
+    let bot_state = Arc::new(RwLock::new(polycopier::state::BotState::default()));
     let router = polycopier::api::create_router(
-        Arc::new(RwLock::new(polycopier::state::BotState::default())),
+        bot_state.clone(),
         Arc::new(Mutex::new(polycopier::copy_ledger::CopyLedger::default())),
     );
     let response = router
@@ -59,6 +60,21 @@ async fn dashboard_requires_authentication_and_never_returns_key() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    bot_state.write().await.paper_integrity_fault = true;
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/control")
+                .header("authorization", &header)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"action":"resume"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
     std::env::set_var("POLYCOPIER_MODE", "live");
     let response = router
         .clone()

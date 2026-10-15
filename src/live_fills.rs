@@ -269,6 +269,9 @@ pub struct Projection {
     pub fees: Decimal,
     /// One outcome for a completely closed copied position, not per partial fill.
     pub closed_outcomes: Vec<(String, Decimal, i64)>,
+    /// Source lots reconstructed from finalized fills in chain order.
+    #[serde(skip)]
+    pub source_entries: Vec<crate::copy_ledger::CopyEntry>,
 }
 pub fn project(fills: &[Fill], journal: &BTreeMap<String, Record>) -> anyhow::Result<Projection> {
     let owned: BTreeMap<_, _> = journal
@@ -288,7 +291,9 @@ pub fn project(fills: &[Fill], journal: &BTreeMap<String, Record>) -> anyhow::Re
         }
     }
     let mut result = Projection::default();
+    let mut source_ledger = crate::copy_ledger::CopyLedger::new_in_memory();
     let mut order_totals = BTreeMap::<String, Decimal>::new();
+    let mut order_spend = BTreeMap::<String, Decimal>::new();
     for fill in events.values() {
         let record = owned[&fill.order_id.to_lowercase()];
         anyhow::ensure!(
@@ -304,28 +309,83 @@ pub fn project(fills: &[Fill], journal: &BTreeMap<String, Record>) -> anyhow::Re
             fill.side != TradeSide::SELL || fill.fee <= fill.collateral,
             "Fee exceeds sale proceeds"
         );
-        let total = order_totals.entry(fill.order_id.clone()).or_default();
-        *total += fill.shares;
-        anyhow::ensure!(
-            *total <= record.order.size,
-            "Settled shares exceed order size"
-        );
+        if let Some(budget) = record.order.budget_usd {
+            anyhow::ensure!(
+                fill.side == TradeSide::BUY && budget > Decimal::ZERO,
+                "Invalid budget order in execution journal"
+            );
+            anyhow::ensure!(
+                fill.collateral <= fill.shares * record.order.price + Decimal::new(1, 6),
+                "Budget fill exceeds the signed price cap"
+            );
+            let spent = order_spend.entry(fill.order_id.clone()).or_default();
+            *spent += fill.collateral + fill.fee;
+            anyhow::ensure!(
+                *spent <= budget + Decimal::new(1, 6),
+                "Settled fill exceeds fee-inclusive USDC budget"
+            );
+        } else {
+            let total = order_totals.entry(fill.order_id.clone()).or_default();
+            *total += fill.shares;
+            anyhow::ensure!(
+                *total <= record.order.size,
+                "Settled shares exceed order size"
+            );
+        }
         let position = result.inventory.entry(fill.token_id.clone()).or_default();
+        let source = record
+            .source_wallet
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Owned fill has no source wallet"))?
+            .to_lowercase();
         result.fees += fill.fee;
         match fill.side {
             TradeSide::BUY => {
+                let fill_cost = fill.collateral + fill.fee;
+                if let Some(entry) = source_ledger
+                    .entries
+                    .iter_mut()
+                    .find(|entry| entry.entry_order_id.as_deref() == Some(fill.order_id.as_str()))
+                {
+                    let remaining = entry.filled_size.unwrap_or(entry.size);
+                    let next_remaining = remaining + fill.shares;
+                    entry.entry_price =
+                        (remaining * entry.entry_price + fill_cost) / next_remaining;
+                    entry.size += fill.shares;
+                    entry.filled_size = Some(next_remaining);
+                    entry.closed = false;
+                    entry.closed_at = None;
+                } else {
+                    source_ledger.record_copy(
+                        fill.token_id.clone(),
+                        source,
+                        fill.shares,
+                        fill_cost / fill.shares,
+                    );
+                    let entry = source_ledger.entries.last_mut().unwrap();
+                    entry.entry_order_id = Some(fill.order_id.clone());
+                    entry.filled_size = Some(fill.shares);
+                    entry.copied_at = chrono::DateTime::from_timestamp(fill.block_timestamp, 0)
+                        .ok_or_else(|| anyhow::anyhow!("Invalid fill timestamp"))?;
+                }
                 if position.shares == Decimal::ZERO {
                     position.entry_order_id = fill.order_id.clone();
                 }
                 position.shares += fill.shares;
-                position.cost_basis += fill.collateral + fill.fee;
+                position.cost_basis += fill_cost;
             }
             TradeSide::SELL => {
                 anyhow::ensure!(
                     fill.shares <= position.shares,
                     "Sale exceeds copier-owned inventory"
                 );
-                let cost = position.cost_basis * fill.shares / position.shares;
+                let cost = source_ledger.record_source_sale(
+                    &fill.token_id,
+                    &source,
+                    fill.shares,
+                    fill.collateral / fill.shares,
+                    fill.fee,
+                )?;
                 let pnl = fill.collateral - fill.fee - cost;
                 position.shares -= fill.shares;
                 position.cost_basis -= cost;
@@ -346,6 +406,40 @@ pub fn project(fills: &[Fill], journal: &BTreeMap<String, Record>) -> anyhow::Re
             }
         }
     }
+    for (order_id, record) in owned {
+        if record.order.side != TradeSide::BUY
+            || source_ledger.entries.iter().any(|entry| {
+                entry
+                    .entry_order_id
+                    .as_deref()
+                    .is_some_and(|id| id.eq_ignore_ascii_case(&order_id))
+            })
+        {
+            continue;
+        }
+        // Legacy journal entries can predate source attribution. They must
+        // remain inert while unfilled; a real fill is rejected above.
+        let Some(source) = record.source_wallet.as_deref() else {
+            continue;
+        };
+        let at = chrono::DateTime::from_timestamp(record.created_at, 0)
+            .ok_or_else(|| anyhow::anyhow!("Invalid order timestamp"))?;
+        source_ledger.entries.push(crate::copy_ledger::CopyEntry {
+            entry_order_id: Some(order_id),
+            token_id: record.order.token_id.clone(),
+            source_wallet: source.to_lowercase(),
+            size: record.order.size,
+            filled_size: Some(Decimal::ZERO),
+            realized_shares: Decimal::ZERO,
+            realized_pnl: Decimal::ZERO,
+            entry_price: record.order.price,
+            source_notional_usd: None,
+            copied_at: at,
+            closed: record.terminal_unfilled,
+            closed_at: record.terminal_unfilled.then_some(at),
+        });
+    }
+    result.source_entries = source_ledger.entries;
     Ok(result)
 }
 
@@ -362,7 +456,37 @@ pub fn sync_risk(risk: &mut crate::risk::RiskEngine) -> anyhow::Result<()> {
 }
 pub fn accounted(fills: &[Fill], journal: &BTreeMap<String, Record>) -> anyhow::Result<Projection> {
     let mut book = project(fills, journal)?;
-    crate::redemption_settlement::apply(&mut book, &crate::live_redemption::records()?, fills)?;
+    let redemptions = crate::live_redemption::records()?;
+    crate::redemption_settlement::apply(&mut book, &redemptions, fills)?;
+    for record in redemptions.values() {
+        let proof = record.proof.as_ref().unwrap(); // verified by apply above
+        let settled_at = chrono::DateTime::from_timestamp(proof.block_timestamp, 0)
+            .ok_or_else(|| anyhow::anyhow!("Invalid redemption timestamp"))?;
+        for (token, asset) in &record.assets {
+            let owned: Decimal = book
+                .source_entries
+                .iter()
+                .filter(|entry| !entry.closed && entry.token_id == *token)
+                .map(|entry| entry.filled_size.unwrap_or(entry.size))
+                .sum();
+            anyhow::ensure!(
+                owned == asset.shares,
+                "Source lots differ from redeemed shares"
+            );
+            for entry in book
+                .source_entries
+                .iter_mut()
+                .filter(|entry| !entry.closed && entry.token_id == *token)
+            {
+                let shares = entry.filled_size.unwrap_or(entry.size);
+                entry.realized_shares += shares;
+                entry.realized_pnl += shares * (asset.payout_per_share - entry.entry_price);
+                entry.filled_size = Some(Decimal::ZERO);
+                entry.closed = true;
+                entry.closed_at = Some(settled_at);
+            }
+        }
+    }
     Ok(book)
 }
 pub fn persist(fills: &[Fill]) -> anyhow::Result<()> {
@@ -455,14 +579,9 @@ pub async fn collect(
     persist(&fills)?;
     // An absent open order is not evidence of cancellation. Query its exact
     // owned ID and release a zero-filled entry only on explicit CANCELED.
-    let mut latest = BTreeMap::new();
-    for record in journal
-        .values()
-        .filter(|r| r.status == "accepted" && r.order.side == TradeSide::BUY)
-    {
-        latest.insert(record.order.token_id.clone(), record);
-    }
-    for record in latest.values().filter(|r| !r.terminal_unfilled) {
+    for record in journal.values().filter(|r| {
+        r.status == "accepted" && r.order.side == TradeSide::BUY && !r.terminal_unfilled
+    }) {
         let id = record.order_id.as_ref().unwrap();
         if fills.iter().any(|f| f.order_id.eq_ignore_ascii_case(id)) {
             continue;
@@ -490,87 +609,45 @@ pub async fn apply(
     ledger: &std::sync::Arc<tokio::sync::Mutex<crate::copy_ledger::CopyLedger>>,
 ) -> anyhow::Result<()> {
     let projection = accounted(fills, journal)?;
-    let mut latest = BTreeMap::new();
-    for record in journal
-        .values()
-        .filter(|r| r.status == "accepted" && r.order.side == TradeSide::BUY)
-    {
-        latest.insert(record.order.token_id.clone(), record);
-    }
     let mut durable_ledger = ledger.lock().await;
     let mut ledger = durable_ledger.clone();
-    for (token, record) in latest {
-        let id = record
-            .order_id
+    let journal_buy_ids: std::collections::HashSet<String> = journal
+        .values()
+        .filter(|record| record.status == "accepted" && record.order.side == TradeSide::BUY)
+        .filter_map(|record| record.order_id.as_ref().map(|id| id.to_lowercase()))
+        .collect();
+    ledger.entries.retain(|entry| {
+        entry
+            .entry_order_id
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Entry order ID missing"))?;
-        let source = record
-            .source_wallet
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Entry source missing; reconcile old journal"))?;
-        let inventory = projection.inventory.get(&token);
-        let this_cycle = inventory.is_some_and(|p| p.entry_order_id.eq_ignore_ascii_case(id));
-        let held = if this_cycle {
-            inventory.unwrap().shares
-        } else {
-            Decimal::ZERO
-        };
+            .is_none_or(|id| !journal_buy_ids.contains(&id.to_lowercase()))
+    });
+    anyhow::ensure!(
+        ledger.entries.iter().all(|entry| entry.closed),
+        "Active live source lot has no accepted order in the execution journal"
+    );
+    ledger
+        .entries
+        .extend(projection.source_entries.iter().cloned());
+    for (token, inventory) in &projection.inventory {
+        let active = ledger
+            .entries
+            .iter()
+            .filter(|entry| !entry.closed && entry.token_id == *token)
+            .collect::<Vec<_>>();
+        let shares: Decimal = active
+            .iter()
+            .map(|entry| entry.filled_size.unwrap_or(entry.size))
+            .sum();
+        let basis: Decimal = active
+            .iter()
+            .map(|entry| entry.filled_size.unwrap_or(entry.size) * entry.entry_price)
+            .sum();
         anyhow::ensure!(
-            this_cycle || inventory.is_none_or(|p| p.shares == Decimal::ZERO),
-            "Entry overlaps unreconciled previous inventory"
+            shares == inventory.shares
+                && (basis - inventory.cost_basis).abs() <= Decimal::new(1, 6),
+            "Source lots differ from confirmed live inventory"
         );
-        let index = ledger.entries.iter().position(|e| {
-            e.entry_order_id
-                .as_ref()
-                .is_some_and(|e| e.eq_ignore_ascii_case(id))
-        });
-        let index = if let Some(index) = index {
-            index
-        } else {
-            if let Some(entry) = ledger.entries.iter_mut().find(|e| {
-                !e.closed
-                    && e.token_id == token
-                    && e.entry_order_id.is_none()
-                    && e.source_wallet.eq_ignore_ascii_case(source)
-            }) {
-                entry.entry_order_id = Some(id.clone());
-            } else {
-                anyhow::ensure!(
-                    !ledger.has_any_active(&token),
-                    "Conflicting active ledger entry"
-                );
-                ledger.record_copy(
-                    token.clone(),
-                    source.clone(),
-                    record.order.size,
-                    record.order.price,
-                );
-                ledger.entries.last_mut().unwrap().entry_order_id = Some(id.clone());
-                ledger.entries.last_mut().unwrap().copied_at =
-                    chrono::DateTime::from_timestamp(record.created_at, 0)
-                        .ok_or_else(|| anyhow::anyhow!("Invalid entry timestamp"))?;
-            }
-            ledger
-                .entries
-                .iter()
-                .position(|e| e.entry_order_id.as_ref() == Some(id))
-                .unwrap()
-        };
-        let entry = &mut ledger.entries[index];
-        anyhow::ensure!(
-            !record.terminal_unfilled || !this_cycle,
-            "Canceled unfilled entry has settlement fills"
-        );
-        entry.filled_size = Some(held);
-        if held > Decimal::ZERO {
-            entry.entry_price = inventory.unwrap().cost_basis / held;
-            entry.closed = false;
-            entry.closed_at = None;
-        }
-        if (this_cycle && held == Decimal::ZERO) || record.terminal_unfilled {
-            entry.closed = true;
-            entry.closed_at.get_or_insert_with(chrono::Utc::now);
-        }
     }
     ledger.try_save()?;
     *durable_ledger = ledger;

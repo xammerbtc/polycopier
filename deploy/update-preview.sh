@@ -10,10 +10,17 @@ backup="/opt/polycopier/deploy-backups/$(date -u +%Y%m%dT%H%M%SZ)"
 install -d -m 700 "$backup"
 cp "/proc/$preview_pid/exe" "$backup/polycopier"
 cp config.toml "$backup/config.toml"
+python3 deploy/preserve-paper-telemetry.py capture "$backup/paper-telemetry.json"
 systemctl stop polycopier-preview
 for name in simulation_state.json sim_copy_ledger.json runtime-risk.json; do
     test ! -f "$name" || cp "$name" "$backup/$name"
 done
+if ! python3 deploy/preserve-paper-telemetry.py merge "$backup/paper-telemetry.json"; then
+    cp "$backup/polycopier" target/release/polycopier
+    systemctl start polycopier-preview
+    echo "Paper telemetry migration failed; previous binary restored" >&2
+    exit 1
+fi
 systemctl start polycopier-preview
 ready=0
 for attempt in $(seq 1 30); do

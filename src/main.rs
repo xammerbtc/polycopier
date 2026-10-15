@@ -16,6 +16,7 @@ pub mod models;
 pub mod order_watcher;
 pub mod position_scanner;
 pub mod prices;
+pub mod profit_guard;
 pub mod redemption;
 pub mod redemption_settlement;
 pub mod risk;
@@ -278,7 +279,16 @@ async fn main() -> anyhow::Result<()> {
     } else {
         "copy_ledger.json"
     };
-    let copy_ledger = Arc::new(Mutex::new(copy_ledger::CopyLedger::load_from(ledger_path)));
+    let ledger = if config.is_sim {
+        let guard = state.read().await;
+        let ledger =
+            copy_ledger::CopyLedger::load_for_paper(ledger_path, !guard.positions.is_empty())?;
+        ledger.validate_paper_positions(&guard.positions)?;
+        ledger
+    } else {
+        copy_ledger::CopyLedger::load_from_checked(ledger_path)?
+    };
+    let copy_ledger = Arc::new(Mutex::new(ledger));
 
     // No strategy or signal producer runs before authoritative wallet/order seeds.
     // A failed wallet read is not an empty wallet.
@@ -360,6 +370,20 @@ async fn main() -> anyhow::Result<()> {
     // Position scanner — safe to start now; seed has completed.
     position_scanner::start_position_scanner(config.clone(), state.clone(), event_tx.clone());
     prices::start(state.clone());
+    if config.is_sim {
+        redemption::start_paper_settlement(state.clone(), copy_ledger.clone());
+        let starting_bank = std::env::var("PAPER_STARTING_BALANCE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .or(config.sim_balance)
+            .unwrap_or(rust_decimal::Decimal::from(10000));
+        profit_guard::start_paper(
+            state.clone(),
+            copy_ledger.clone(),
+            event_tx.clone(),
+            starting_bank,
+        );
+    }
 
     // Position-close sweep — backstop that emits synthetic SELLs for any
     // position we hold that no target still holds (catches missed WS SELL events).

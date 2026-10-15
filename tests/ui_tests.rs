@@ -112,9 +112,9 @@ fn screen_starts_at_first_field() {
 }
 
 #[test]
-fn screen_has_twenty_one_fields() {
+fn screen_has_twenty_two_fields() {
     let s = SettingsScreen::new();
-    assert_eq!(s.fields.len(), 21);
+    assert_eq!(s.fields.len(), 22);
 }
 
 // ── SettingsScreen change detection ──────────────────────────────────────────
@@ -155,7 +155,7 @@ fn up_key_does_not_underflow() {
 fn down_key_does_not_overflow_past_last_field() {
     let mut s = SettingsScreen::new();
     let last = s.fields.len() - 1;
-    for _ in 0..20 {
+    for _ in 0..s.fields.len() + 2 {
         s.handle_key(key(KeyCode::Down));
     }
     assert_eq!(s.selected, last);
@@ -262,7 +262,7 @@ fn tempfile_path() -> std::path::PathBuf {
     ))
 }
 
-/// Build a screen with all 15 fields pre-populated with known values.
+/// Build a screen with all fields pre-populated with known values.
 fn minimal_screen() -> SettingsScreen {
     let mut s = SettingsScreen::new();
     // Field order matches SettingsScreen::new():
@@ -274,19 +274,20 @@ fn minimal_screen() -> SettingsScreen {
     // 5: execution.max_trade_size_usd
     // 6: execution.max_slippage_pct
     // 7: execution.max_delay_seconds
-    // 8: execution.ignore_closing_in_mins
-    // 9: execution.sell_fee_buffer
-    // 10: scanner.max_copy_loss_pct
-    // 11: scanner.max_copy_gain_pct
-    // 12: scanner.min_entry_price
-    // 13: scanner.max_entry_price
-    // 14: scanner.max_entries_per_cycle
-    // 15: scanner.min_amount
-    // 16: scanner.max_amount
-    // 17: risk.max_daily_volume_usd
-    // 18: risk.max_consecutive_losses
-    // 19: risk.loss_cooldown_secs
-    // 20: ledger.retention_days
+    // 8: execution.max_buy_delay_seconds
+    // 9: execution.ignore_closing_in_mins
+    // 10: execution.sell_fee_buffer
+    // 11: scanner.max_copy_loss_pct
+    // 12: scanner.max_copy_gain_pct
+    // 13: scanner.min_entry_price
+    // 14: scanner.max_entry_price
+    // 15: scanner.max_entries_per_cycle
+    // 16: scanner.min_amount
+    // 17: scanner.max_amount
+    // 18: risk.max_daily_volume_usd
+    // 19: risk.max_consecutive_losses
+    // 20: risk.loss_cooldown_secs
+    // 21: ledger.retention_days
     let known = [
         "0xPK",
         "0xFA",
@@ -296,6 +297,7 @@ fn minimal_screen() -> SettingsScreen {
         "50.00",
         "0.02",
         "2",
+        "",
         "15",
         "0.97",
         "0.40",
@@ -342,8 +344,8 @@ fn save_to_path_writes_toml_with_execution_section() {
 fn save_to_path_writes_correct_max_entries_value() {
     let tmp = tempfile_path();
     let mut s = minimal_screen();
-    // scanner.max_entries_per_cycle (field 14) = "3"
-    s.fields[14].value = "3".into();
+    // scanner.max_entries_per_cycle (field 15) = "3"
+    s.fields[15].value = "3".into();
     s.save_to_path(&tmp).expect("save failed");
 
     let content = std::fs::read_to_string(&tmp).unwrap();
@@ -355,10 +357,21 @@ fn save_to_path_writes_correct_max_entries_value() {
 }
 
 #[test]
+fn save_to_path_keeps_optional_buy_age() {
+    let tmp = tempfile_path();
+    let mut screen = minimal_screen();
+    screen.fields[8].value = "15".into();
+    screen.save_to_path(&tmp).expect("save failed");
+    let content = std::fs::read_to_string(&tmp).unwrap();
+    assert!(content.contains("max_buy_delay_seconds = 15"));
+    let _ = std::fs::remove_file(&tmp);
+}
+
+#[test]
 fn save_to_path_writes_risk_section() {
     let tmp = tempfile_path();
     let mut s = minimal_screen();
-    s.fields[18].value = "5".into(); // max_consecutive_losses
+    s.fields[19].value = "5".into(); // max_consecutive_losses
     s.save_to_path(&tmp).expect("save failed");
 
     let content = std::fs::read_to_string(&tmp).unwrap();

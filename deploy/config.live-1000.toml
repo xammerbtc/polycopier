@@ -1,0 +1,41 @@
+# Staged $1,000 live profile. Do not activate until credentials, wallet funding,
+# sell ownership, settlement, and venue-order verification pass.
+# Paper ranking on 2026-10-15: BreakTheBank 5 stars, about +47% tracked ROI;
+# the previous second source fell to 3 stars. Recheck before live activation.
+# One source at 1%: about $516 historical full-lot peak plus a $200 reserve.
+# Paper activity can raise this; the live gate must recalculate before activation.
+# Keep other wallets under observation in the paper service.
+[targets]
+wallets = [
+  "0xf0318c32136c2db7fec88b84869aee6a1106c80c:1:BreakTheBank",
+]
+
+[execution]
+max_slippage_pct = 0.015
+max_trade_size_usd = 100
+max_delay_seconds = 300
+max_buy_delay_seconds = 15
+sell_fee_buffer = 1
+ignore_closing_in_mins = 0
+
+[sizing]
+mode = "bank_scaled"
+copy_size_pct = 0.01
+
+[scanner]
+max_copy_loss_pct = 0.25
+max_copy_gain_pct = 0.04
+min_entry_price = 0.03
+max_entry_price = 0.98
+# Monitor old holdings, but deploy cash only on new observed fills.
+max_entries_per_cycle = 0
+
+[risk]
+max_daily_volume_usd = 0
+max_consecutive_losses = 3
+loss_cooldown_secs = 0
+profit_guard_trigger_pct = 0.07
+profit_guard_loss_pct = 0.10
+
+[ledger]
+retention_days = 60

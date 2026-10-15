@@ -17,6 +17,7 @@ pub mod models;
 pub mod order_watcher;
 pub mod position_scanner;
 pub mod prices;
+pub mod profit_guard;
 pub mod redemption;
 pub mod redemption_settlement;
 pub mod risk;

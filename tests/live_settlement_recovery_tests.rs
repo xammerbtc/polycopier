@@ -27,6 +27,7 @@ async fn durable_fills_recover_owned_inventory_and_risk_without_double_counting(
         price: dec!(0.5),
         size: dec!(10),
         side: TradeSide::BUY,
+        budget_usd: None,
     };
     assert!(journal::begin_contextual(&buy).is_err());
     journal::remember_source("123", "0xABC");

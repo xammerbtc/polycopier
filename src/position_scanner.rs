@@ -270,15 +270,18 @@ async fn scan_positions(
     }
 
     // Brief read lock to snapshot our current holdings
-    let (our_token_ids, current_balance) = {
+    let (our_token_ids, current_balance, rejection_reasons) = {
         let guard = state.read().await;
         let ids = guard.positions.keys().cloned().collect();
         let bal = guard.total_balance;
-        (ids, bal)
+        let reasons = guard.rejection_reasons.clone();
+        (ids, bal, reasons)
     };
     let our_token_ids: HashSet<String> = our_token_ids;
 
     let mut all_positions: Vec<TargetPosition> = Vec::new();
+    let mut failed_wallets: HashSet<String> = HashSet::new();
+    let mut fetched_wallets = 0usize;
     // Gap 3 fix: tuple includes percent_pnl so we can sort by it correctly.
     let mut to_enter: Vec<(String, TradeEvent, Decimal)> = Vec::new();
 
@@ -296,9 +299,11 @@ async fn scan_positions(
             Ok(p) => p,
             Err(e) => {
                 warn!("Failed to fetch positions for {}: {}", wallet_str, e);
-                return Err(e); // let the caller apply backoff
+                failed_wallets.insert(wallet_str.to_ascii_lowercase());
+                continue;
             }
         };
+        fetched_wallets += 1;
 
         debug!(
             "Scanner: {} has {} open position(s)",
@@ -359,10 +364,7 @@ async fn scan_positions(
                 pos.title.clone()
             };
 
-            let engine_reason = {
-                let guard = state.read().await;
-                guard.rejection_reasons.get(&token_id).cloned()
-            };
+            let engine_reason = rejection_reasons.get(&token_id).cloned();
 
             all_positions.push(TargetPosition {
                 title,
@@ -379,17 +381,36 @@ async fn scan_positions(
         }
     }
 
+    if fetched_wallets == 0 && !config.target_wallets.is_empty() {
+        anyhow::bail!(
+            "Position scan failed for every target wallet; keeping the previous dashboard snapshot"
+        );
+    }
+
+    // A temporary Data API failure for one leader must not block healthy leaders,
+    // nor erase the last known rows for the unavailable wallet.
+    if !failed_wallets.is_empty() {
+        let guard = state.read().await;
+        all_positions.extend(
+            guard
+                .target_positions
+                .iter()
+                .filter(|position| {
+                    failed_wallets.contains(&position.source_wallet.to_ascii_lowercase())
+                })
+                .cloned(),
+        );
+    }
+
     let mut sized_entries: Vec<(String, TradeEvent, Decimal)> = Vec::new();
     let mut dropped_entries = Vec::new();
     let mut cleared_entries = Vec::new();
 
     for (token_id, ev, percent_pnl) in to_enter {
-        let pos_avg = all_positions
-            .iter()
-            .find(|p| p.token_id == token_id)
-            .map(|p| p.avg_price)
-            .unwrap_or(ev.price);
-        let target_notional = pos_avg * ev.size;
+        // `ev.price` already carries this wallet's own average entry price.
+        // Searching all_positions here made large scans quadratic and could
+        // accidentally use another wallet's average for the same token.
+        let target_notional = ev.price * ev.size;
         let wallet_scalar = config
             .target_scalars
             .get(&ev.maker_address)

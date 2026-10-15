@@ -25,6 +25,7 @@ async fn exact_order_ownership_and_uncertain_startup_protect_shared_wallet() {
         price: dec!(0.5),
         size: dec!(10),
         side: TradeSide::BUY,
+        budget_usd: None,
     };
     let intent = journal::begin(&request).unwrap();
     assert!(
@@ -96,7 +97,7 @@ async fn exact_order_ownership_and_uncertain_startup_protect_shared_wallet() {
         .await
         .unwrap();
     }
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             if calls.load(Ordering::Relaxed) == 1 && state.read().await.trades_skipped == 2 {
                 break;
@@ -104,8 +105,20 @@ async fn exact_order_ownership_and_uncertain_startup_protect_shared_wallet() {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    assert!(
+        observed.is_ok(),
+        "calls={}, skipped={}, feed={:?}",
+        calls.load(Ordering::Relaxed),
+        state.read().await.trades_skipped,
+        state
+            .read()
+            .await
+            .live_feed
+            .iter()
+            .map(|trade| (&trade.original_event.token_id, &trade.reason))
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         calls.load(Ordering::Relaxed),
         1,
@@ -115,7 +128,7 @@ async fn exact_order_ownership_and_uncertain_startup_protect_shared_wallet() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(
         *sizes.lock().await,
-        vec![dec!(9.70)],
+        vec![dec!(10.00)],
         "shared wallet balance is not copier-owned inventory"
     );
     assert!(

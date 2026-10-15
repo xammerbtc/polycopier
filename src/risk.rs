@@ -7,12 +7,10 @@
 //! | Micro-trade anti-spoofing | — | $1 minimum | original |
 //! | Daily volume limit | `MAX_DAILY_VOLUME_USD` | 0 (disabled) | 12 |
 //! | Consecutive-loss circuit breaker | `MAX_CONSECUTIVE_LOSSES` | 0 (disabled) | 12 |
-//! | Rapid-flip guard | — | 60s cooldown per token | 12 |
 
 use crate::config::Config;
 use crate::models::{TradeEvent, TradeSide};
 use rust_decimal::Decimal;
-use std::collections::HashMap;
 use std::time::Instant;
 
 #[derive(Clone)]
@@ -35,10 +33,6 @@ pub struct RiskEngine {
     consecutive_losses: u32,
     /// If `Some(until)`, all new trades are blocked until `Instant::now() >= until`.
     cooldown_until: Option<Instant>,
-
-    // -- Rapid-flip guard (Gap 12) ----------------------------------------
-    /// token_id → time of last BUY approved for that token.
-    last_buy_at: HashMap<String, Instant>,
 }
 
 impl RiskEngine {
@@ -114,7 +108,13 @@ impl RiskEngine {
         self.check_age(event)?;
         let mut preview = self.clone();
         preview.config.max_daily_volume_usd = Decimal::ZERO;
-        preview.check_trade(event)
+        preview.check_trade_with_signal_policy(
+            event,
+            matches!(
+                preview.config.sizing_mode,
+                crate::config::SizingMode::Fixed | crate::config::SizingMode::BankScaled
+            ),
+        )
     }
 
     pub fn check_execution(&mut self, event: &TradeEvent) -> Result<(), String> {
@@ -124,7 +124,12 @@ impl RiskEngine {
         let max = self.config.scan_max_amount;
         self.config.scan_min_amount = Decimal::ZERO;
         self.config.scan_max_amount = Decimal::MAX;
-        let result = self.check_trade(event);
+        let allow_partial_fixed_paper_fill = self.config.is_sim
+            && matches!(
+                self.config.sizing_mode,
+                crate::config::SizingMode::Fixed | crate::config::SizingMode::BankScaled
+            );
+        let result = self.check_trade_with_signal_policy(event, allow_partial_fixed_paper_fill);
         if result.is_ok() && event.side == TradeSide::BUY && self.cooldown_until.is_none() {
             self.consecutive_losses = losses;
         }
@@ -142,11 +147,23 @@ impl RiskEngine {
         self.config = config;
     }
     fn check_age(&self, event: &TradeEvent) -> Result<(), String> {
+        // Position sweeps are synthesized locally from a successful API snapshot;
+        // they may wait behind a busy event queue and are not stale target prints.
+        if event.transaction_hash.starts_with("sweep_") {
+            return Ok(());
+        }
         let age = chrono::Utc::now().timestamp() - event.timestamp;
-        if age < -1 || age > self.config.max_delay_seconds {
+        let max_age = if event.side == TradeSide::BUY {
+            self.config
+                .max_buy_delay_seconds
+                .unwrap_or(self.config.max_delay_seconds)
+        } else {
+            self.config.max_delay_seconds
+        };
+        if age < -1 || age > max_age {
             return Err(format!(
                 "Stale signal: age {age}s exceeds allowed {}s",
-                self.config.max_delay_seconds
+                max_age
             ));
         }
         Ok(())
@@ -165,7 +182,6 @@ impl RiskEngine {
             daily_reset_date: chrono::Utc::now().date_naive(),
             consecutive_losses: 0,
             cooldown_until: None,
-            last_buy_at: HashMap::new(),
         }
     }
 
@@ -174,6 +190,14 @@ impl RiskEngine {
     /// Returns `Ok(())` if the trade may proceed, or `Err(reason)` to reject it.
     /// Internally updates daily-volume and consecutive-loss state.
     pub fn check_trade(&mut self, trade: &TradeEvent) -> Result<(), String> {
+        self.check_trade_with_signal_policy(trade, false)
+    }
+
+    fn check_trade_with_signal_policy(
+        &mut self,
+        trade: &TradeEvent,
+        fixed_copy_signal: bool,
+    ) -> Result<(), String> {
         // === 0. Reset daily volume at UTC midnight ===
         let today = chrono::Utc::now().date_naive();
         if today != self.daily_reset_date {
@@ -190,6 +214,7 @@ impl RiskEngine {
         if trade.side == crate::models::TradeSide::BUY {
             // === 1. Anti-spoofing: minimum $1 notional ===
             if trade_value < Decimal::from(1)
+                && !fixed_copy_signal
                 && !(self.config.is_sim
                     && self.config.sizing_mode == crate::models::SizingMode::TargetScalar)
             {
@@ -233,28 +258,9 @@ impl RiskEngine {
             ));
         }
 
-        // === 4. Rapid-flip guard (Gap 12): no re-entry within 60 s ===
-        if trade.side == TradeSide::BUY
-            && !(self.config.is_sim
-                && self.config.sizing_mode == crate::models::SizingMode::TargetScalar)
-        {
-            if let Some(&last) = self.last_buy_at.get(&trade.token_id) {
-                let age_secs = last.elapsed().as_secs();
-                if age_secs < 60 {
-                    return Err(format!(
-                        "Rapid-flip guard: token {} was entered {}s ago — cooldown 60s",
-                        &trade.token_id[..trade.token_id.len().min(12)],
-                        age_secs
-                    ));
-                }
-            }
-        }
-
         // === All checks passed — update state ===
         self.daily_volume_usd += trade_value;
         if trade.side == TradeSide::BUY {
-            self.last_buy_at
-                .insert(trade.token_id.clone(), Instant::now());
             // Successful BUY approval resets consecutive-loss counter.
             self.consecutive_losses = 0;
         }

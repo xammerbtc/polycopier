@@ -15,6 +15,10 @@ pub fn start(state: Arc<RwLock<BotState>>) {
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .expect("price client");
+        let mut market_cache = std::collections::HashMap::<
+            String,
+            (crate::markets::Details, std::time::Instant),
+        >::new();
         loop {
             let tokens: Vec<_> = state
                 .read()
@@ -26,6 +30,10 @@ pub fn start(state: Arc<RwLock<BotState>>) {
             let quotes: Vec<_> = stream::iter(tokens)
                 .map(|token| {
                     let client = client.clone();
+                    let cached = market_cache
+                        .get(&token)
+                        .filter(|(_, fetched)| fetched.elapsed().as_secs() < 60)
+                        .map(|(details, _)| details.clone());
                     async move {
                         let midpoint = async {
                             let response = client
@@ -40,39 +48,62 @@ pub fn start(state: Arc<RwLock<BotState>>) {
                             let price = Decimal::from_str(value["mid"].as_str()?).ok()?;
                             (price >= Decimal::ZERO && price <= Decimal::ONE).then_some(price)
                         };
-                        let (mid, market) =
-                            tokio::join!(midpoint, crate::markets::fetch(&client, &token));
-                        let mut details = market
-                            .ok()
-                            .and_then(|m| crate::markets::details(&m, &token).ok());
+                        let mid = midpoint.await;
+                        let (details, refreshed) = if let Some(cached) = cached {
+                            (Some(cached), false)
+                        } else {
+                            let details = crate::markets::fetch(&client, &token)
+                                .await
+                                .ok()
+                                .and_then(|market| crate::markets::details(&market, &token).ok());
+                            (details, true)
+                        };
                         let price =
                             mid.or_else(|| details.as_ref().and_then(|m| m.reference_price));
-                        if let Some(m) = &mut details {
-                            if mid.is_some() {
-                                m.price_source = "CLOB midpoint".into();
-                            }
-                        }
-                        (token, price, details)
+                        let source = if mid.is_some() {
+                            "CLOB midpoint"
+                        } else {
+                            "Gamma reference"
+                        };
+                        let details = details.map(|mut details| {
+                            details.price_source = source.into();
+                            details
+                        });
+                        (token, price, details, refreshed, mid.is_some() || refreshed)
                     }
                 })
                 .buffer_unordered(8)
                 .collect()
                 .await;
             let mut guard = state.write().await;
-            guard.position_prices.clear();
             let held: std::collections::HashSet<_> =
                 guard.reported_positions().keys().cloned().collect();
             guard
+                .position_prices
+                .retain(|token, _| held.contains(token));
+            guard
+                .price_updated_at
+                .retain(|token, _| held.contains(token));
+            guard
                 .position_details
                 .retain(|token, _| held.contains(token));
-            for (token, price, details) in quotes {
+            for (token, price, details, refreshed, quote_refreshed) in quotes {
                 if !held.contains(&token) {
                     continue;
                 }
                 if let Some(price) = price {
                     guard.position_prices.insert(token.clone(), price);
+                    if quote_refreshed {
+                        guard
+                            .price_updated_at
+                            .insert(token.clone(), chrono::Utc::now().timestamp() as u64);
+                    }
                 }
                 if let Some(details) = details {
+                    if refreshed {
+                        market_cache
+                            .insert(token.clone(), (details.clone(), std::time::Instant::now()));
+                    }
                     guard.position_details.insert(token, details);
                 }
             }

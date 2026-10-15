@@ -10,9 +10,11 @@ Group=polycopier
 WorkingDirectory=/opt/polycopier
 EnvironmentFile=/opt/polycopier/.env
 Environment=POLYCOPIER_MODE=simulation
+Environment=HOT_RELOAD_ENABLED=true
 Environment=RISK_STATE_PATH=/opt/polycopier/runtime-risk.json
 Environment=RUST_LOG=polycopier=info,warn
-ExecStart=/opt/polycopier/target/release/polycopier --ui-reboot --sim --sim-balance 200
+Environment=PAPER_COPY_MAX_PRICE=0.98
+ExecStart=/opt/polycopier/target/release/polycopier --ui-reboot --sim --sim-balance 10000
 Restart=on-failure
 RestartSec=8
 TimeoutStopSec=30

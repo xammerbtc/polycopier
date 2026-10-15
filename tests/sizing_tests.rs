@@ -5,8 +5,68 @@
 mod common;
 
 use polycopier::models::SizingMode;
-use polycopier::strategy::{compute_order_usd, MIN_ORDER_SHARES};
+use polycopier::strategy::{
+    affordable_buy_limit, budget_meets_min_order, compute_order_usd, MIN_ORDER_SHARES,
+};
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+
+#[test]
+fn small_budget_can_buy_five_shares_at_an_affordable_price() {
+    assert_eq!(affordable_buy_limit(dec!(2), dec!(0.98)), Some(dec!(0.39)));
+    assert_eq!(affordable_buy_limit(dec!(5), dec!(0.98)), Some(dec!(0.98)));
+    assert_eq!(affordable_buy_limit(dec!(1), dec!(0.98)), Some(dec!(0.19)));
+    assert_eq!(affordable_buy_limit(dec!(0.01), dec!(0.98)), None);
+    assert!(budget_meets_min_order(
+        dec!(2),
+        affordable_buy_limit(dec!(2), dec!(0.98)).unwrap()
+    ));
+}
+
+#[test]
+fn fee_inclusive_budget_must_request_five_shares_at_the_limit() {
+    assert!(!budget_meets_min_order(dec!(4.89), dec!(0.98)));
+    assert!(budget_meets_min_order(dec!(4.90), dec!(0.98)));
+    assert!(!budget_meets_min_order(dec!(1), dec!(0.98)));
+    assert!(budget_meets_min_order(dec!(1), dec!(0.20)));
+}
+
+#[test]
+fn bank_scaled_copies_small_stakes_and_percent_of_entire_large_stake() {
+    let budget = |source| {
+        compute_order_usd(
+            dec!(1000),
+            &SizingMode::BankScaled,
+            Some(dec!(0.01)),
+            Decimal::ONE,
+            dec!(100),
+            source,
+        )
+    };
+    assert_eq!(budget(dec!(7)), dec!(7));
+    assert_eq!(budget(dec!(10)), dec!(10));
+    assert_eq!(budget(dec!(30)), Decimal::ZERO);
+    assert_eq!(budget(dec!(100)), dec!(1));
+    assert_eq!(budget(dec!(500)), dec!(5));
+    assert_eq!(budget(dec!(1000)), dec!(10));
+    assert_eq!(budget(dec!(100000)), dec!(100));
+    assert_eq!(budget(dec!(10.50)), Decimal::ZERO);
+}
+
+#[test]
+fn bank_scaled_never_shrinks_an_order_to_fit_remaining_cash() {
+    assert_eq!(
+        compute_order_usd(
+            dec!(5),
+            &SizingMode::BankScaled,
+            Some(dec!(0.10)),
+            Decimal::ONE,
+            dec!(20),
+            dec!(8),
+        ),
+        Decimal::ZERO
+    );
+}
 
 // -- Helpers ------------------------------------------------------------------
 

@@ -7,7 +7,8 @@ finish_build() {
     build_status=$?
     printf '%s\n' "$build_status" > /opt/polycopier/build.exit
     flock -u 9
-    if ! python3 deploy/storage-maintenance.py --apply; then
+    cd /opt/polycopier
+    if ! python3 /opt/polycopier/deploy/storage-maintenance.py --apply; then
         echo "Storage maintenance needs attention; see storage-status.json and journal" >&2
     fi
     exit "$build_status"

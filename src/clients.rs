@@ -6,8 +6,8 @@ use alloy::signers::Signer;
 use anyhow::{bail, Result};
 use core::pin::Pin;
 use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
-use polymarket_client_sdk::clob::types::Side as SdkSide;
 use polymarket_client_sdk::clob::types::SignatureType;
+use polymarket_client_sdk::clob::types::{Amount, OrderType, Side as SdkSide};
 use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
 use polymarket_client_sdk::types::U256;
 use rust_decimal::Decimal;
@@ -78,11 +78,8 @@ pub async fn build_order_submitter(
 
         Box::pin(async move {
             tracing::info!(
-                "Executing Limit Order: Side={:?}, Price={}, Size={}, Token={}",
-                order.side,
-                order.price,
-                order.size,
-                order.token_id
+                "Submitting order: Side={:?}, PriceCap={}, SizeEstimate={}, BudgetUSD={:?}, Token={}",
+                order.side, order.price, order.size, order.budget_usd, order.token_id
             );
 
             let side = match order.side {
@@ -90,15 +87,33 @@ pub async fn build_order_submitter(
                 TradeSide::SELL => SdkSide::Sell,
             };
 
-            let order_req = clob
-                .limit_order()
-                // token_id from Data API is a decimal U256 string
-                .token_id(U256::from_str(&order.token_id)?)
-                .size(order.size)
-                .price(order.price)
-                .side(side)
-                .build()
-                .await?;
+            // A fixed-dollar BUY must specify USDC, not shares: a FAK market
+            // order sweeps available asks up to the price cap and cancels the
+            // remainder. The SDK reserves fee headroom inside this same budget.
+            let token_id = U256::from_str(&order.token_id)?;
+            let order_req = if let Some(budget) = order.budget_usd {
+                anyhow::ensure!(
+                    order.side == TradeSide::BUY && budget > Decimal::ZERO,
+                    "Only BUY orders may use a USDC budget"
+                );
+                clob.market_order()
+                    .token_id(token_id)
+                    .amount(Amount::usdc(budget)?)
+                    .price(order.price)
+                    .side(side)
+                    .order_type(OrderType::FAK)
+                    .user_usdc_balance(budget)
+                    .build()
+                    .await?
+            } else {
+                clob.limit_order()
+                    .token_id(token_id)
+                    .size(order.size)
+                    .price(order.price)
+                    .side(side)
+                    .build()
+                    .await?
+            };
 
             let signed_order = clob.sign(&signer, order_req).await?;
             let intent = crate::execution_journal::begin_contextual(&order)?;

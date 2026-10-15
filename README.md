@@ -121,7 +121,7 @@ The bot can also run **headless** (no TUI) as a systemd daemon on a Linux server
   - **Target Position USD Bounding** — filters out targets whose notional trade size falls outside `min_amount` and `max_amount` configured in the scanner block
   - **Daily volume limit** — `MAX_DAILY_VOLUME_USD` (0 = disabled); counts both BUY and SELL side; resets at UTC midnight
   - **Consecutive-loss circuit breaker** — `MAX_CONSECUTIVE_LOSSES` (0 = disabled); pauses trading for `LOSS_COOLDOWN_SECS` after N consecutive losses
-  - **Rapid-flip guard** — 60-second cooldown per token prevents the bot from immediately re-entering a position it just exited
+  - **Repeated fills** — separate leader BUY fills for the same token can each be copied; signal deduplication remains transaction-specific
   - **Scanner guards** applied only to catch-up (scanner) entries:
     - `MAX_COPY_LOSS_PCT` — skip if target is already this far underwater
     - `MAX_COPY_GAIN_PCT` — skip if target is already this far in profit (chasing adds slippage)
@@ -505,7 +505,7 @@ main.rs
   |                        applies risk checks, submits orders via OrderSubmitter
   |
   +-- risk.rs             RiskEngine: micro-trade filter, daily volume cap,
-  |                        consecutive-loss circuit breaker, rapid-flip guard (60s per token)
+  |                        consecutive-loss circuit breaker
   |
   +-- state.rs            Shared BotState (Arc<RwLock<_>>): balance, our positions,
   |                        target positions, live feed, TUI counters, refresh timestamps
@@ -625,7 +625,7 @@ cargo fmt
 | `tests/integration.rs` | Strategy engine: intent classification, one-position-per-token, SELL gating, risk guards, slippage, deduplication; scanner sort, sell fee buffer, scan_max_entries, unrealized PnL |
 | `tests/backoff_tests.rs` | `next_backoff` — base interval, doubling, cap, overflow safety |
 | `tests/listener_tests.rs` | Dedup ring-buffer eviction; `try_send` backpressure semantics |
-| `tests/risk_tests.rs` | `RiskEngine` — daily volume limit, consecutive-loss circuit breaker, rapid-flip guard, anti-spoofing |
+| `tests/risk_tests.rs` | `RiskEngine` — daily volume limit, consecutive-loss circuit breaker, repeated fills, anti-spoofing |
 | `tests/order_watcher_tests.rs` | Cancel-decision predicate; wallet_sync position upsert/remove rules; expiry alignment (`< today` for scanner and watcher) |
 | `tests/sizing_tests.rs` | `compute_order_usd` for all four sizing modes + floor/cap guards |
 | `tests/copied_counter_tests.rs` | `count_intersection` pure function: empty, full, partial, no overlap, multi-target |

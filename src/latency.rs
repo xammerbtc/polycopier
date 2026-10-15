@@ -2,9 +2,9 @@
 use crate::models::TradeEvent;
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{LazyLock, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Default, Serialize)]
@@ -30,6 +30,40 @@ pub struct Metrics {
     pub last_dispatch_event_key: Option<String>,
     pub last_dispatch_at: Option<i64>,
     pub last_websocket_fill_age_upper_bound_ms: Option<i64>,
+    pub dispatch_latency_samples: usize,
+    pub receive_to_dispatch_p50_ms: Option<u64>,
+    pub receive_to_dispatch_p95_ms: Option<u64>,
+    pub receive_to_dispatch_p99_ms: Option<u64>,
+    pub acceptance_latency_samples: usize,
+    pub receive_to_accept_p50_ms: Option<u64>,
+    pub receive_to_accept_p95_ms: Option<u64>,
+    #[serde(skip)]
+    recent_dispatch_ms: VecDeque<(Instant, u64)>,
+    #[serde(skip)]
+    recent_accept_ms: VecDeque<(Instant, u64)>,
+}
+const LATENCY_SAMPLE_CAP: usize = 1024;
+const LATENCY_SAMPLE_WINDOW: Duration = Duration::from_secs(300);
+
+fn record_sample(samples: &mut VecDeque<(Instant, u64)>, value: u64) {
+    while samples
+        .front()
+        .is_some_and(|(at, _)| at.elapsed() > LATENCY_SAMPLE_WINDOW)
+    {
+        samples.pop_front();
+    }
+    if samples.len() == LATENCY_SAMPLE_CAP {
+        samples.pop_front();
+    }
+    samples.push_back((Instant::now(), value));
+}
+
+fn percentile(sorted: &[u64], percent: usize) -> Option<u64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let index = (sorted.len() * percent).div_ceil(100).saturating_sub(1);
+    sorted.get(index).copied()
 }
 type Observation = (Instant, &'static str);
 static METRICS: LazyLock<Mutex<Metrics>> = LazyLock::new(|| Mutex::new(Metrics::default()));
@@ -111,6 +145,9 @@ pub fn dispatch(event: &TradeEvent) {
     metrics.order_dispatches += 1;
     metrics.last_receive_to_dispatch_ms =
         observation.map(|(when, _)| when.elapsed().as_millis() as u64);
+    if let Some(ms) = metrics.last_receive_to_dispatch_ms {
+        record_sample(&mut metrics.recent_dispatch_ms, ms);
+    }
     metrics.last_source = observation.map(|(_, source)| source.to_string());
     metrics.last_dispatch_event_key = observation.map(|_| crate::rtds::event_key(event));
     metrics.last_fill_to_dispatch_upper_bound_ms = observation
@@ -121,6 +158,27 @@ pub fn dispatch(event: &TradeEvent) {
 pub fn snapshot() -> Metrics {
     let mut metrics = METRICS.lock().unwrap().clone();
     metrics.execution_mode = std::env::var("POLYCOPIER_MODE").unwrap_or_else(|_| "unknown".into());
+    let mut dispatch = metrics
+        .recent_dispatch_ms
+        .iter()
+        .filter(|(at, _)| at.elapsed() <= LATENCY_SAMPLE_WINDOW)
+        .map(|(_, ms)| *ms)
+        .collect::<Vec<_>>();
+    dispatch.sort_unstable();
+    metrics.dispatch_latency_samples = dispatch.len();
+    metrics.receive_to_dispatch_p50_ms = percentile(&dispatch, 50);
+    metrics.receive_to_dispatch_p95_ms = percentile(&dispatch, 95);
+    metrics.receive_to_dispatch_p99_ms = percentile(&dispatch, 99);
+    let mut accepted = metrics
+        .recent_accept_ms
+        .iter()
+        .filter(|(at, _)| at.elapsed() <= LATENCY_SAMPLE_WINDOW)
+        .map(|(_, ms)| *ms)
+        .collect::<Vec<_>>();
+    accepted.sort_unstable();
+    metrics.acceptance_latency_samples = accepted.len();
+    metrics.receive_to_accept_p50_ms = percentile(&accepted, 50);
+    metrics.receive_to_accept_p95_ms = percentile(&accepted, 95);
     metrics
 }
 pub fn accepted(event: &TradeEvent) {
@@ -134,6 +192,9 @@ pub fn accepted(event: &TradeEvent) {
     metrics.last_accept_event_key = observation.map(|_| crate::rtds::event_key(event));
     metrics.last_receive_to_accept_ms =
         observation.map(|(when, _)| when.elapsed().as_millis() as u64);
+    if let Some(ms) = metrics.last_receive_to_accept_ms {
+        record_sample(&mut metrics.recent_accept_ms, ms);
+    }
     metrics.last_fill_to_accept_upper_bound_ms = observation
         .map(|_| chrono::Utc::now().timestamp_millis() - event.timestamp.saturating_mul(1000));
     tracing::info!(
@@ -146,6 +207,33 @@ pub fn accepted(event: &TradeEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bounded_latency_samples_report_nearest_rank_percentiles() {
+        let mut samples = VecDeque::new();
+        for ms in 1..=LATENCY_SAMPLE_CAP as u64 + 1 {
+            record_sample(&mut samples, ms);
+        }
+        assert_eq!(samples.len(), LATENCY_SAMPLE_CAP);
+        assert_eq!(samples.front().map(|(_, ms)| *ms), Some(2));
+        let sorted = samples.into_iter().map(|(_, ms)| ms).collect::<Vec<_>>();
+        assert_eq!(percentile(&sorted, 50), Some(513));
+        assert_eq!(percentile(&sorted, 95), Some(974));
+        assert_eq!(percentile(&sorted, 99), Some(1015));
+        assert_eq!(percentile(&[], 95), None);
+    }
+    #[test]
+    fn stale_latency_samples_do_not_affect_current_window() {
+        let mut samples = VecDeque::from([
+            (
+                Instant::now() - LATENCY_SAMPLE_WINDOW - Duration::from_secs(1),
+                9000,
+            ),
+            (Instant::now(), 120),
+        ]);
+        record_sample(&mut samples, 100);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples.front().map(|(_, ms)| *ms), Some(120));
+    }
     #[test]
     fn synthetic_events_cannot_be_reported_as_measured_fill_latency() {
         let event = TradeEvent {

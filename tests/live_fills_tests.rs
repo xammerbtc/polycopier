@@ -26,6 +26,7 @@ fn real_public_v2_event_preserves_exact_settlement_fee() {
                 price: dec!(0.65),
                 size: dec!(24),
                 side: TradeSide::BUY,
+                budget_usd: None,
             },
             status: "accepted".into(),
             order_id: Some(id.into()),
@@ -57,11 +58,98 @@ fn order(side: TradeSide, id: &str, size: rust_decimal::Decimal) -> Record {
             price: dec!(0.5),
             size,
             side,
+            budget_usd: None,
         },
         status: "accepted".into(),
         order_id: Some(id.into()),
         created_at: 0,
     }
+}
+
+#[test]
+fn budget_order_accepts_more_shares_at_better_prices_but_never_overspends() {
+    let mut record = order(TradeSide::BUY, "budget-order", dec!(5.10));
+    record.order.price = dec!(0.98);
+    record.order.budget_usd = Some(dec!(5));
+    let journal = BTreeMap::from([("budget".into(), record)]);
+    let fill = polycopier::live_fills::Fill {
+        transaction_hash: "0x1".into(),
+        block_hash: "0x2".into(),
+        block_number: 1,
+        block_timestamp: 1,
+        transaction_index: 0,
+        log_index: 0,
+        order_id: "budget-order".into(),
+        token_id: "123".into(),
+        side: TradeSide::BUY,
+        shares: dec!(10),
+        collateral: dec!(4.5),
+        fee: dec!(0.1),
+    };
+    let projection = project(std::slice::from_ref(&fill), &journal).unwrap();
+    assert_eq!(projection.inventory["123"].shares, dec!(10));
+    let mut over_budget = fill.clone();
+    over_budget.collateral = dec!(4.95);
+    assert!(project(&[over_budget], &journal).is_err());
+    let mut above_cap = fill;
+    above_cap.collateral = dec!(9.9);
+    assert!(project(&[above_cap], &journal)
+        .unwrap_err()
+        .to_string()
+        .contains("signed price cap"));
+}
+
+#[test]
+fn repeated_live_buys_keep_source_lots_separate_on_partial_sale() {
+    let mut first = order(TradeSide::BUY, "buy-a", dec!(10));
+    first.source_wallet = Some("source-a".into());
+    let mut second = order(TradeSide::BUY, "buy-b", dec!(10));
+    second.source_wallet = Some("source-b".into());
+    let mut sale = order(TradeSide::SELL, "sell-a", dec!(5));
+    sale.source_wallet = Some("source-a".into());
+    let journal = BTreeMap::from([
+        ("a".into(), first),
+        ("b".into(), second),
+        ("c".into(), sale),
+    ]);
+    let make_fill =
+        |id: &str, side: TradeSide, shares, collateral, log_index| polycopier::live_fills::Fill {
+            transaction_hash: format!("tx-{log_index}"),
+            block_hash: "block".into(),
+            block_number: 1,
+            block_timestamp: 1,
+            transaction_index: 0,
+            log_index,
+            order_id: id.into(),
+            token_id: "123".into(),
+            side,
+            shares,
+            collateral,
+            fee: dec!(0),
+        };
+    let fills = [
+        make_fill("buy-a", TradeSide::BUY, dec!(10), dec!(4), 0),
+        make_fill("buy-b", TradeSide::BUY, dec!(10), dec!(7), 1),
+        make_fill("sell-a", TradeSide::SELL, dec!(5), dec!(3), 2),
+    ];
+    let projection = project(&fills, &journal).unwrap();
+    assert_eq!(projection.inventory["123"].shares, dec!(15));
+    assert_eq!(projection.inventory["123"].cost_basis, dec!(9));
+    assert_eq!(projection.realized_pnl, dec!(1));
+    let a = projection
+        .source_entries
+        .iter()
+        .find(|entry| entry.source_wallet == "source-a")
+        .unwrap();
+    let b = projection
+        .source_entries
+        .iter()
+        .find(|entry| entry.source_wallet == "source-b")
+        .unwrap();
+    assert_eq!(a.filled_size, Some(dec!(5)));
+    assert_eq!(a.realized_pnl, dec!(1));
+    assert_eq!(b.filled_size, Some(dec!(10)));
+    assert_eq!(b.realized_pnl, dec!(0));
 }
 fn receipt(
     side: u64,

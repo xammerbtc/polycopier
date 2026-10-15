@@ -24,6 +24,7 @@ pub fn test_config() -> Config {
         max_slippage_pct: dec!(0.02),
         max_trade_size_usd: dec!(10.00),
         max_delay_seconds: 2,
+        max_buy_delay_seconds: None,
         max_copy_loss_pct: dec!(0.40),
         max_copy_gain_pct: dec!(0.05),
         min_entry_price: dec!(0.02),
@@ -39,6 +40,8 @@ pub fn test_config() -> Config {
         max_daily_volume_usd: dec!(0),
         max_consecutive_losses: 0,
         loss_cooldown_secs: 300,
+        profit_guard_trigger_pct: dec!(0.07),
+        profit_guard_loss_pct: dec!(0.10),
         is_sim: false,
         sim_balance: None,
     }
