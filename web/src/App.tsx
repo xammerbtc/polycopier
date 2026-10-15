@@ -161,6 +161,16 @@ function App() {
   const realizedPnl = Number(state.realized_pnl || 0);
   const unrealizedPnl = Number(state.unrealized_pnl || 0);
   const startingBalance = Number(state.starting_balance ?? 10000);
+  const unpricedPositions = positions.filter((position) => state.position_prices?.[position.token_id] === undefined);
+  const pricedMarketValue = positions.reduce((sum, position) => {
+    const price = state.position_prices?.[position.token_id];
+    return price === undefined ? sum : sum + Number(position.size) * Number(price);
+  }, 0);
+  const unpricedShares = unpricedPositions.reduce((sum, position) => sum + Number(position.size), 0);
+  const equityFloor = currentBalance + pricedMarketValue;
+  const equityCeiling = equityFloor + unpricedShares;
+  const pnlFloor = equityFloor - startingBalance;
+  const pnlCeiling = equityCeiling - startingBalance;
   const targetPerformance: TargetPerformance[] = state.target_performance || [];
   const targetNames = new Map<string, string>(targetPerformance.map((target): [string, string] => [target.address.toLowerCase(), target.name]));
   const skipReasonCounts = (state.live_feed || []).reduce((counts: Record<string, number>, trade: { validated: boolean; reason?: string | null }) => {
@@ -273,9 +283,10 @@ function App() {
           </div>
           <div className="stat-card">
             <span className="stat-label">Open PnL (unrealized)</span>
-            <span className={`stat-value ${parseFloat(state.unrealized_pnl) < 0 ? 'val-negative' : parseFloat(state.unrealized_pnl) > 0 ? 'val-positive' : 'val-neutral'}`}>
-              {Object.keys(state.positions || {}).every(id => state.position_prices?.[id] !== undefined) ? `$${parseFloat(state.unrealized_pnl).toFixed(2)}` : 'Prices unavailable'}
+            <span className={`stat-value ${unpricedPositions.length > 0 ? 'val-neutral' : unrealizedPnl < 0 ? 'val-negative' : unrealizedPnl > 0 ? 'val-positive' : 'val-neutral'}`}>
+              {unpricedPositions.length === 0 ? `$${unrealizedPnl.toFixed(2)}` : `Partial $${unrealizedPnl.toFixed(2)}`}
             </span>
+            {unpricedPositions.length > 0 && <span className="stat-note">{unpricedPositions.length} position(s) have no quote</span>}
           </div>
           <div className="stat-card">
             <span className="stat-label">Signals validated</span>
@@ -308,13 +319,13 @@ function App() {
           </div>
           {state.mode === 'simulation' && <div className="stat-card">
             <span className="stat-label">Portfolio equity (cash + open market value)</span>
-            <span className="stat-value">{state.equity == null ? 'Incomplete prices' : `$${Number(state.equity).toFixed(2)}`}</span>
-            <span style={{color:'var(--text-secondary)',fontSize:'12px'}}>Quotes: {state.priced_positions}/{positions.length}</span>
+            <span className="stat-value">{state.equity == null ? `≥ $${equityFloor.toFixed(2)}` : `$${Number(state.equity).toFixed(2)}`}</span>
+            <span style={{color:'var(--text-secondary)',fontSize:'12px'}}>{unpricedPositions.length > 0 ? `Upper bound $${equityCeiling.toFixed(2)} · ` : ''}Quotes: {state.priced_positions}/{positions.length}</span>
           </div>}
           {state.mode === 'simulation' && <div className="stat-card">
             <span className="stat-label">Total PnL vs starting bank</span>
-            <span className={`stat-value ${Number(state.total_pnl) < 0 ? 'val-negative' : Number(state.total_pnl) > 0 ? 'val-positive' : ''}`}>{state.total_pnl == null ? 'Incomplete prices' : `${Number(state.total_pnl) >= 0 ? '+' : ''}$${Number(state.total_pnl).toFixed(2)}`}</span>
-            <span style={{color:'var(--text-secondary)',fontSize:'12px'}}>Open cost ${Number(state.open_cost_basis).toFixed(2)}</span>
+            <span className={`stat-value ${state.total_pnl == null ? '' : Number(state.total_pnl) < 0 ? 'val-negative' : Number(state.total_pnl) > 0 ? 'val-positive' : ''}`}>{state.total_pnl == null ? `≥ ${pnlFloor < 0 ? '-' : '+'}$${Math.abs(pnlFloor).toFixed(2)}` : `${Number(state.total_pnl) >= 0 ? '+' : ''}$${Number(state.total_pnl).toFixed(2)}`}</span>
+            <span style={{color:'var(--text-secondary)',fontSize:'12px'}}>{state.total_pnl == null ? `Upper bound $${pnlCeiling.toFixed(2)} · ` : ''}Open cost ${Number(state.open_cost_basis).toFixed(2)}</span>
           </div>}
           <div className="stat-card"><span className="stat-label">Daily Volume</span><span className="stat-value">${parseFloat(state.daily_volume_usd).toFixed(2)}</span></div>
         </div>
