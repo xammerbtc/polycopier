@@ -4,6 +4,51 @@ use rust_decimal::Decimal;
 use std::{str::FromStr, sync::Arc};
 use tokio::sync::RwLock;
 
+async fn fetch_midpoints(
+    client: &reqwest::Client,
+    tokens: &[String],
+) -> std::collections::HashMap<String, Decimal> {
+    let chunks: Vec<Vec<String>> = tokens.chunks(50).map(|chunk| chunk.to_vec()).collect();
+    let batches = stream::iter(chunks)
+        .map(|chunk| {
+            let client = client.clone();
+            async move {
+                let body: Vec<_> = chunk
+                    .iter()
+                    .map(|token| serde_json::json!({ "token_id": token }))
+                    .collect();
+                let response = client
+                    .post("https://clob.polymarket.com/midpoints")
+                    .json(&body)
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                response
+                    .json::<std::collections::HashMap<String, String>>()
+                    .await
+            }
+        })
+        .buffer_unordered(3)
+        .collect::<Vec<_>>()
+        .await;
+    let mut midpoints = std::collections::HashMap::new();
+    for result in batches {
+        match result {
+            Ok(batch) => {
+                for (token, raw) in batch {
+                    if let Ok(price) = Decimal::from_str(&raw) {
+                        if price >= Decimal::ZERO && price <= Decimal::ONE {
+                            midpoints.insert(token, price);
+                        }
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "CLOB midpoint batch failed"),
+        }
+    }
+    midpoints
+}
+
 /// Independently price our holdings, even after targets remove their positions.
 pub fn start(state: Arc<RwLock<BotState>>) {
     tokio::spawn(async move {
@@ -36,49 +81,34 @@ pub fn start(state: Arc<RwLock<BotState>>) {
                 })
                 .cloned()
                 .collect();
-            let batch_details = crate::markets::fetch_batch(&client, &refresh_tokens).await;
-            let quotes: Vec<_> = stream::iter(tokens)
+            let (batch_details, midpoints) = tokio::join!(
+                crate::markets::fetch_batch(&client, &refresh_tokens),
+                fetch_midpoints(&client, &tokens)
+            );
+            let quotes: Vec<_> = tokens
+                .into_iter()
                 .map(|token| {
-                    let client = client.clone();
                     let cached = market_cache
                         .get(&token)
                         .filter(|(_, fetched)| fetched.elapsed().as_secs() < 300)
                         .map(|(details, _)| details.clone());
                     let fetched = batch_details.get(&token).cloned();
-                    async move {
-                        let midpoint = async {
-                            let response = client
-                                .get("https://clob.polymarket.com/midpoint")
-                                .query(&[("token_id", &token)])
-                                .send()
-                                .await
-                                .ok()?
-                                .error_for_status()
-                                .ok()?;
-                            let value: serde_json::Value = response.json().await.ok()?;
-                            let price = Decimal::from_str(value["mid"].as_str()?).ok()?;
-                            (price >= Decimal::ZERO && price <= Decimal::ONE).then_some(price)
-                        };
-                        let mid = midpoint.await;
-                        let refreshed = fetched.is_some();
-                        let details = fetched.or(cached);
-                        let price =
-                            mid.or_else(|| details.as_ref().and_then(|m| m.reference_price));
-                        let source = if mid.is_some() {
-                            "CLOB midpoint"
-                        } else {
-                            "Gamma reference"
-                        };
-                        let details = details.map(|mut details| {
-                            details.price_source = source.into();
-                            details
-                        });
-                        (token, price, details, refreshed, mid.is_some() || refreshed)
-                    }
+                    let mid = midpoints.get(&token).copied();
+                    let refreshed = fetched.is_some();
+                    let details = fetched.or(cached);
+                    let price = mid.or_else(|| details.as_ref().and_then(|m| m.reference_price));
+                    let source = if mid.is_some() {
+                        "CLOB midpoint"
+                    } else {
+                        "Gamma reference"
+                    };
+                    let details = details.map(|mut details| {
+                        details.price_source = source.into();
+                        details
+                    });
+                    (token, price, details, refreshed, mid.is_some() || refreshed)
                 })
-                .buffer_unordered(8)
-                .collect()
-                .await;
+                .collect();
             let mut guard = state.write().await;
             let held: std::collections::HashSet<_> =
                 guard.reported_positions().keys().cloned().collect();
