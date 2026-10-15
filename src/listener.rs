@@ -16,12 +16,10 @@ const SEEN_HASHES_CAP: usize = 20000;
 pub static LAST_POLL_SUCCESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ACTIVE_TARGETS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
 
-fn fallback_poll_interval(websocket_connected: bool) -> std::time::Duration {
-    if websocket_connected {
-        std::time::Duration::from_secs(15)
-    } else {
-        std::time::Duration::from_secs(5)
-    }
+fn fallback_poll_interval(_websocket_connected: bool) -> std::time::Duration {
+    // Maker fills often arrive through the Data API even with a healthy RTDS
+    // connection. A 15-second sweep loses them at the 15-second BUY age cap.
+    std::time::Duration::from_secs(5)
 }
 
 fn target_retry_cooldown(error: &str) -> std::time::Duration {
@@ -203,8 +201,7 @@ pub async fn start_ws_listener(config: &Config, tx: mpsc::Sender<TradeEvent>) ->
             }
 
             // The stream is the primary signal source. Keep the public activity
-            // API as a low-rate recovery sweep while connected; accelerate it
-            // during WebSocket outages. A target-specific cooldown prevents a
+            // API as a five-second recovery sweep even while connected. A target-specific cooldown prevents a
             // 429 from being retried on every cycle. The fixed 5-minute
             // overlap plus exact fill deduplication closes short polling gaps.
             let cadence = fallback_poll_interval(websocket_connected);
@@ -308,8 +305,8 @@ mod pagination_tests {
     use super::*;
 
     #[test]
-    fn fallback_polling_slows_when_websocket_is_healthy() {
-        assert_eq!(fallback_poll_interval(true).as_secs(), 15);
+    fn fallback_polling_covers_maker_fills_with_healthy_websocket() {
+        assert_eq!(fallback_poll_interval(true).as_secs(), 5);
         assert_eq!(fallback_poll_interval(false).as_secs(), 5);
     }
 

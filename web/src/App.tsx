@@ -489,7 +489,7 @@ function App() {
 
           <div className="glass-panel" style={{ marginBottom: '1.5rem' }}>
             <div className="panel-header">Signal monitoring</div>
-            <p>WebSocket primary · Data API recovery targets 15s while connected and 5s if disconnected · maker and taker fills. Recovery searches 5 minutes of fills; BUY and SELL age limits apply separately.</p>
+            <p>WebSocket primary · Data API recovery targets 5s with per-wallet backoff · maker and taker fills. Recovery searches 5 minutes of fills; BUY and SELL age limits apply separately.</p>
             {state.metrics && <p>Unique signals: {state.metrics.unique_signals_delivered} · Duplicates filtered: {state.metrics.duplicate_signals} · Poll errors: {state.metrics.polling_errors} · Page-limit warnings: {state.metrics.polling_page_limit_hits} · Last poll: {state.metrics.last_poll_duration_ms ?? '—'} ms</p>}
             {state.metrics && <p>Receive → order dispatch, last 5 minutes: p50 {state.metrics.receive_to_dispatch_p50_ms ?? '—'} ms · p95 {state.metrics.receive_to_dispatch_p95_ms ?? '—'} ms · {state.metrics.dispatch_latency_samples} measured orders</p>}
             <p style={{ color: 'var(--text-secondary)' }}>A received signal can still be skipped; the Live Feed shows the reason. Signals validated is a pre-execution count.</p>
