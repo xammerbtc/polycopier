@@ -82,3 +82,14 @@ __pycache__/
 /storage-status.json
 /.storage-status-*
 /storage-logrotate.status
+
+# Generated graph, local agent state, and recoverable operator snapshots.
+/.codex/
+/graphify-out/
+/.paper-bank-*-applied
+/config.toml.before-*
+/simulation_state.json.before-*
+/src/*.rs.before-*
+/web/dist-before-*/
+/web/dist.rollback-*/
+/polycopier.log.*.gz
