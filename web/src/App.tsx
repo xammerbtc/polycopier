@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import SettingsManager from './SettingsManager';
 import SetupWizard from './SetupWizard';
 import Operations from './Operations';
-import type { Order, Position, PositionSourceAllocation, StateResponse, TargetPosition, TargetPerformance } from './types';
+import type { FeedTrade, Order, Position, PositionSourceAllocation, StateResponse, TargetPosition, TargetPerformance } from './types';
 
 const skipLabels: Record<string, string> = {
   minimum_order: 'Order minimum',
@@ -178,7 +178,7 @@ function App() {
   const pnlCeiling = equityCeiling - startingBalance;
   const targetPerformance: TargetPerformance[] = state.target_performance || [];
   const targetNames = new Map<string, string>(targetPerformance.map((target): [string, string] => [target.address.toLowerCase(), target.name]));
-  const skipReasonCounts = (state.live_feed || []).reduce((counts: Record<string, number>, trade: { validated: boolean; reason?: string | null }) => {
+  const skipReasonCounts = (state.live_feed || []).reduce((counts: Record<string, number>, trade: FeedTrade) => {
     if (!trade.validated && trade.reason) {
       const reason = String(trade.reason).replace(/\s+/g, ' ').trim();
       const category = /no asks available at or below/.test(reason)
@@ -186,7 +186,9 @@ function App() {
         : /source notional.*order minimum/.test(reason)
           ? 'Source stake below $1 order minimum'
           : /SELL book unavailable.*404/.test(reason)
-            ? 'Sell book unavailable (market may be closed)'
+            ? state.position_details?.[trade.original_event.token_id]?.closed === true
+              ? 'SELL on confirmed closed market; settlement path'
+              : 'SELL book 404; market status unconfirmed here'
             : /closing long we never entered/.test(reason)
               ? 'Leader sold shares we never bought'
               : reason.split(':')[0].slice(0, 90);
