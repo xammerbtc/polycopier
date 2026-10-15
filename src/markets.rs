@@ -39,6 +39,64 @@ pub async fn fetch(client: &reqwest::Client, token: &str) -> anyhow::Result<Valu
     anyhow::bail!("No exact token market, including closed markets")
 }
 
+/// Resolve many held tokens with a bounded number of Gamma requests. A market
+/// can contain more than one requested token, so match each returned token
+/// exactly rather than assuming the response order matches the query order.
+pub async fn fetch_batch(
+    client: &reqwest::Client,
+    requested: &[String],
+) -> std::collections::HashMap<String, Details> {
+    let wanted: std::collections::HashSet<&str> = requested.iter().map(String::as_str).collect();
+    let mut found = std::collections::HashMap::new();
+    for chunk in requested.chunks(40) {
+        for closed in ["false", "true"] {
+            let mut query: Vec<(&str, &str)> = chunk
+                .iter()
+                .map(|token| ("clob_token_ids", token.as_str()))
+                .collect();
+            query.push(("closed", closed));
+            query.push(("limit", "100"));
+            let response = client
+                .get("https://gamma-api.polymarket.com/markets")
+                .query(&query)
+                .send()
+                .await;
+            let markets: Vec<Value> = match response {
+                Ok(response) => match response.error_for_status() {
+                    Ok(response) => match response.json().await {
+                        Ok(markets) => markets,
+                        Err(error) => {
+                            tracing::warn!(%error, "Gamma batch response could not be decoded");
+                            continue;
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(%error, "Gamma batch request failed");
+                        continue;
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "Gamma batch request failed");
+                    continue;
+                }
+            };
+            for market in markets {
+                if let Ok(ids) = tokens(&market) {
+                    for token in ids {
+                        if wanted.contains(token.as_str()) {
+                            if let Ok(details) = details(&market, &token) {
+                                found.insert(token, details);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    found
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Details {
     pub title: String,

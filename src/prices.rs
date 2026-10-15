@@ -27,13 +27,24 @@ pub fn start(state: Arc<RwLock<BotState>>) {
                 .keys()
                 .cloned()
                 .collect();
+            let refresh_tokens: Vec<_> = tokens
+                .iter()
+                .filter(|token| {
+                    market_cache
+                        .get(*token)
+                        .is_none_or(|(_, fetched)| fetched.elapsed().as_secs() >= 300)
+                })
+                .cloned()
+                .collect();
+            let batch_details = crate::markets::fetch_batch(&client, &refresh_tokens).await;
             let quotes: Vec<_> = stream::iter(tokens)
                 .map(|token| {
                     let client = client.clone();
                     let cached = market_cache
                         .get(&token)
-                        .filter(|(_, fetched)| fetched.elapsed().as_secs() < 60)
+                        .filter(|(_, fetched)| fetched.elapsed().as_secs() < 300)
                         .map(|(details, _)| details.clone());
+                    let fetched = batch_details.get(&token).cloned();
                     async move {
                         let midpoint = async {
                             let response = client
@@ -49,15 +60,8 @@ pub fn start(state: Arc<RwLock<BotState>>) {
                             (price >= Decimal::ZERO && price <= Decimal::ONE).then_some(price)
                         };
                         let mid = midpoint.await;
-                        let (details, refreshed) = if let Some(cached) = cached {
-                            (Some(cached), false)
-                        } else {
-                            let details = crate::markets::fetch(&client, &token)
-                                .await
-                                .ok()
-                                .and_then(|market| crate::markets::details(&market, &token).ok());
-                            (details, true)
-                        };
+                        let refreshed = fetched.is_some();
+                        let details = fetched.or(cached);
                         let price =
                             mid.or_else(|| details.as_ref().and_then(|m| m.reference_price));
                         let source = if mid.is_some() {
