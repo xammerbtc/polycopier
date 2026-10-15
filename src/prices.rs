@@ -72,6 +72,11 @@ pub fn start(state: Arc<RwLock<BotState>>) {
                 .keys()
                 .cloned()
                 .collect();
+            {
+                let held: std::collections::HashSet<&str> =
+                    tokens.iter().map(String::as_str).collect();
+                market_cache.retain(|token, _| held.contains(token.as_str()));
+            }
             let refresh_tokens: Vec<_> = tokens
                 .iter()
                 .filter(|token| {
