@@ -109,6 +109,10 @@ def analyze(ledger: dict, profile: dict, bank: Decimal) -> dict:
         known_outstanding += delta
         known_peak = max(known_peak, known_outstanding)
     known_span_seconds = int((max(known_times) - min(known_times)).total_seconds()) if len(known_times) > 1 else 0
+    observed_source_lots = (source_lots_meeting_five_share_minimum
+                            + source_lots_below_five_share_minimum)
+    feasible_source_pct = (Decimal(100) * source_lots_meeting_five_share_minimum
+                           / observed_source_lots if observed_source_lots else Decimal(0))
     reserve = bank * Decimal('0.20')
     cents = Decimal('0.01')
     return {
@@ -116,6 +120,8 @@ def analyze(ledger: dict, profile: dict, bank: Decimal) -> dict:
         'copy_pct': str(pct),
         'planned_lots': tracked,
         'lots_with_source_notional': source_notional_lots,
+        'observed_source_lots_with_notional': observed_source_lots,
+        'source_five_share_feasibility_pct': str(feasible_source_pct.quantize(Decimal('0.1'))),
         'source_lots_meeting_five_share_minimum_at_paper_price': source_lots_meeting_five_share_minimum,
         'source_lots_below_five_share_minimum_at_paper_price': source_lots_below_five_share_minimum,
         'source_lots_below_one_dollar_minimum': source_lots_below_one_dollar_minimum,

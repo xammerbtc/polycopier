@@ -29,6 +29,20 @@ class PreflightStatusTests(unittest.TestCase):
             (False, '2000', False),
         )
 
+    def test_source_sample_requires_executable_coverage_and_capacity(self):
+        sample = {
+            'lots_with_source_notional': 100,
+            'source_lots_meeting_five_share_minimum_at_paper_price': 20,
+            'source_five_share_feasibility_pct': '20.0',
+            'known_source_sample_span_seconds': 90000,
+            'known_source_peak_with_reserve_fits_bank': True,
+        }
+        self.assertFalse(gate.source_sample_sufficient(sample))
+        sample['source_five_share_feasibility_pct'] = '80.0'
+        self.assertTrue(gate.source_sample_sufficient(sample))
+        sample['known_source_peak_with_reserve_fits_bank'] = False
+        self.assertFalse(gate.source_sample_sufficient(sample))
+
 
 if __name__ == '__main__':
     unittest.main()

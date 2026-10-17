@@ -29,6 +29,16 @@ def preflight_status(returncode: int, stdout: str) -> tuple[bool, str | None, bo
     return connected, available, funded
 
 
+def source_sample_sufficient(capacity: dict) -> bool:
+    return (
+        capacity.get('lots_with_source_notional', 0) >= 20
+        and capacity.get('source_lots_meeting_five_share_minimum_at_paper_price', 0) >= 20
+        and Decimal(capacity.get('source_five_share_feasibility_pct', '0')) >= Decimal('80')
+        and capacity.get('known_source_sample_span_seconds', 0) >= 86400
+        and capacity.get('known_source_peak_with_reserve_fits_bank', False)
+    )
+
+
 def call(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(args, capture_output=True, text=True, timeout=35)
 
@@ -140,6 +150,8 @@ def main() -> None:
     report['historical_capacity_with_reserve'] = capacity.get('historical_peak_with_reserve_fits_bank', False)
     report['historical_peak_proxy_usd'] = capacity.get('peak_full_lot_proxy_usd')
     report['source_notional_lots'] = capacity.get('lots_with_source_notional', 0)
+    report['observed_source_lots_with_notional'] = capacity.get('observed_source_lots_with_notional', 0)
+    report['source_five_share_feasibility_pct'] = capacity.get('source_five_share_feasibility_pct', '0')
     report['source_lots_meeting_five_share_minimum_at_paper_price'] = capacity.get(
         'source_lots_meeting_five_share_minimum_at_paper_price', 0)
     report['source_lots_below_one_dollar_minimum'] = capacity.get(
@@ -147,12 +159,7 @@ def main() -> None:
     report['legacy_proxy_lots'] = capacity.get('legacy_lots_using_paper_cost_proxy', 0)
     report['source_sample_span_hours'] = round(capacity.get('known_source_sample_span_seconds', 0) / 3600, 1)
     report['source_sample_capacity_with_reserve'] = capacity.get('known_source_peak_with_reserve_fits_bank', False)
-    report['source_sample_sufficient'] = (
-        report['source_notional_lots'] >= 20
-        and report['source_lots_meeting_five_share_minimum_at_paper_price'] >= 20
-        and capacity.get('known_source_sample_span_seconds', 0) >= 86400
-        and report['source_sample_capacity_with_reserve']
-    )
+    report['source_sample_sufficient'] = source_sample_sufficient(capacity)
     try:
         preflight_command = (str(ROOT / 'target/release/live_preflight'),
                              str(env), str(profile_file), '0')

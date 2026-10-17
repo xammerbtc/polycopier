@@ -64,6 +64,8 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(result['known_source_current_usd'], '10.00')
         self.assertEqual(result['known_source_sample_span_seconds'], 0)
         self.assertEqual(result['source_lots_meeting_five_share_minimum_at_paper_price'], 1)
+        self.assertEqual(result['observed_source_lots_with_notional'], 1)
+        self.assertEqual(result['source_five_share_feasibility_pct'], '100.0')
 
     def test_five_share_feasibility_uses_exact_source_notional(self):
         profile = {
@@ -83,6 +85,28 @@ class CapacityTests(unittest.TestCase):
         self.assertEqual(result['source_lots_below_five_share_minimum_at_paper_price'], 1)
         self.assertEqual(result['source_lots_below_one_dollar_minimum'], 1)
         self.assertEqual(result['planned_lots'], 0)
+        self.assertEqual(result['source_five_share_feasibility_pct'], '0.0')
+
+    def test_feasibility_reports_fraction_of_observed_source_lots(self):
+        profile = {
+            'targets': {'wallets': ['a:1:Alpha']},
+            'sizing': {'mode': 'bank_scaled', 'copy_size_pct': 0.01},
+            'execution': {'max_trade_size_usd': 100},
+        }
+        ledger = {
+            'performance_since': '2026-10-14T00:00:00Z',
+            'entries': [
+                {'source_wallet': 'a', 'size': '20', 'filled_size': '20',
+                 'entry_price': '0.5', 'source_notional_usd': '1000',
+                 'copied_at': '2026-10-14T01:00:00Z', 'closed': False},
+                {'source_wallet': 'a', 'size': '20', 'filled_size': '20',
+                 'entry_price': '0.5', 'source_notional_usd': '30',
+                 'copied_at': '2026-10-14T02:00:00Z', 'closed': False},
+            ],
+        }
+        result = capacity.analyze(ledger, profile, Decimal(1000))
+        self.assertEqual(result['observed_source_lots_with_notional'], 2)
+        self.assertEqual(result['source_five_share_feasibility_pct'], '50.0')
 
 
 if __name__ == '__main__':
