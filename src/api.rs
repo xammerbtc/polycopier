@@ -869,6 +869,34 @@ fn remaining_lot_size(entry: &crate::copy_ledger::CopyEntry) -> Decimal {
     entry.filled_size.unwrap_or(entry.size).max(Decimal::ZERO)
 }
 
+type SourceAllocations = HashMap<String, HashMap<String, (Decimal, Decimal, Decimal)>>;
+
+fn record_position_source_allocation(
+    allocations: &mut SourceAllocations,
+    entry: &crate::copy_ledger::CopyEntry,
+    positions: &HashMap<String, Position>,
+    prices: &HashMap<String, Decimal>,
+) {
+    if entry.closed || !positions.contains_key(&entry.token_id) {
+        return;
+    }
+    let shares = remaining_lot_size(entry);
+    if shares <= Decimal::ZERO {
+        return;
+    }
+    let cost = shares * entry.entry_price;
+    let allocation = allocations
+        .entry(entry.token_id.clone())
+        .or_default()
+        .entry(entry.source_wallet.to_ascii_lowercase())
+        .or_default();
+    allocation.0 += shares;
+    allocation.1 += cost;
+    if let Some(price) = prices.get(&entry.token_id) {
+        allocation.2 += shares * *price - cost;
+    }
+}
+
 #[derive(Serialize)]
 pub struct PositionSourceAllocation {
     pub address: String,
@@ -1023,10 +1051,17 @@ async fn get_state(State(api_state): State<ApiState>) -> Json<StateResponse> {
         .collect();
     let mut target_open_tokens =
         vec![std::collections::HashSet::<String>::new(); target_performance.len()];
-    let mut source_allocations: HashMap<String, HashMap<String, (Decimal, Decimal, Decimal)>> =
-        HashMap::new();
+    let mut source_allocations = SourceAllocations::new();
     let mut invested_basis = vec![Decimal::ZERO; target_performance.len()];
     for entry in &ledger.entries {
+        // Holdings keep their source attribution after a target is removed or
+        // the performance baseline moves forward.
+        record_position_source_allocation(
+            &mut source_allocations,
+            entry,
+            positions,
+            &guard.position_prices,
+        );
         let Some(index) = performance_index.get(&entry.source_wallet.to_ascii_lowercase()) else {
             continue;
         };
@@ -1055,16 +1090,6 @@ async fn get_state(State(api_state): State<ApiState>) -> Json<StateResponse> {
                 let value = lot_size * *price;
                 stats.open_value += value;
                 stats.open_pnl += value - cost;
-            }
-            let allocation = source_allocations
-                .entry(entry.token_id.clone())
-                .or_default()
-                .entry(entry.source_wallet.to_ascii_lowercase())
-                .or_default();
-            allocation.0 += lot_size;
-            allocation.1 += cost;
-            if let Some(price) = guard.position_prices.get(&entry.token_id) {
-                allocation.2 += lot_size * *price - cost;
             }
         }
     }
@@ -1426,9 +1451,11 @@ pub fn create_router_with_client(
 
 #[cfg(test)]
 mod performance_tests {
-    use super::remaining_lot_size;
+    use super::{record_position_source_allocation, remaining_lot_size, SourceAllocations};
     use crate::copy_ledger::CopyLedger;
+    use crate::models::Position;
     use rust_decimal_macros::dec;
+    use std::collections::HashMap;
 
     #[test]
     fn dashboard_uses_remaining_shares_after_partial_source_sale() {
@@ -1443,5 +1470,36 @@ mod performance_tests {
         assert_eq!(lot.realized_shares, dec!(4));
         assert_eq!(remaining_lot_size(lot), dec!(6));
         assert_eq!(remaining_lot_size(lot) * lot.entry_price, dec!(3));
+    }
+
+    #[test]
+    fn open_shares_keep_source_after_target_removal_or_baseline_change() {
+        let mut ledger = CopyLedger::default();
+        ledger
+            .record_filled_copy("token".into(), "former-source".into(), dec!(10), dec!(0.5))
+            .unwrap();
+        ledger
+            .record_source_sale("token", "former-source", dec!(4), dec!(0.7), dec!(0))
+            .unwrap();
+        let positions = HashMap::from([(
+            "token".into(),
+            Position {
+                token_id: "token".into(),
+                size: dec!(6),
+                average_entry_price: dec!(0.5),
+            },
+        )]);
+        let prices = HashMap::from([("token".into(), dec!(0.6))]);
+        let mut allocations = SourceAllocations::new();
+        record_position_source_allocation(
+            &mut allocations,
+            &ledger.entries[0],
+            &positions,
+            &prices,
+        );
+        assert_eq!(
+            allocations["token"]["former-source"],
+            (dec!(6), dec!(3), dec!(0.6))
+        );
     }
 }
