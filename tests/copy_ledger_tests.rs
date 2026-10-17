@@ -3,7 +3,7 @@
 //!
 //! Run: `cargo test --test copy_ledger_tests`
 
-use polycopier::copy_ledger::CopyLedger;
+use polycopier::copy_ledger::{CopyEntry, CopyLedger};
 use rust_decimal_macros::dec;
 use std::collections::HashSet;
 
@@ -41,6 +41,28 @@ fn record_copy_creates_active_entry() {
     assert_eq!(e.entry_price, dec!(0.50));
     assert!(!e.closed);
     assert!(e.closed_at.is_none());
+}
+
+#[test]
+fn paper_lot_preserves_source_dollars_and_reads_legacy_entries() {
+    let mut ledger = ledger();
+    ledger
+        .record_filled_copy_with_source(
+            "tok_a".into(),
+            "0xabc".into(),
+            dec!(10),
+            dec!(0.40),
+            dec!(8.50),
+        )
+        .unwrap();
+    let encoded = serde_json::to_value(&ledger.entries[0]).unwrap();
+    assert_eq!(encoded["source_notional_usd"], "8.50");
+    let restored: CopyEntry = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(restored.source_notional_usd, Some(dec!(8.50)));
+    let mut old = encoded;
+    old.as_object_mut().unwrap().remove("source_notional_usd");
+    let legacy: CopyEntry = serde_json::from_value(old).unwrap();
+    assert_eq!(legacy.source_notional_usd, None);
 }
 
 #[test]
@@ -223,6 +245,39 @@ fn persistence_round_trip_preserves_all_entries() {
 }
 
 #[test]
+fn paper_fill_is_persisted_with_confirmed_shares() {
+    let path = tmp_path("paper_fill");
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut ledger = CopyLedger::load_from(&path);
+        ledger
+            .record_filled_copy("tok_a".into(), "0xabc".into(), dec!(8), dec!(0.4))
+            .unwrap();
+    }
+    let restored = CopyLedger::load_from(&path);
+    assert_eq!(restored.entries.len(), 1);
+    assert_eq!(restored.entries[0].filled_size, Some(dec!(8)));
+    assert_eq!(restored.active_size_for_source("tok_a", "0xabc"), dec!(8));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn paper_ledger_mutations_report_persistence_failure() {
+    let path = tmp_path("write_failure");
+    let mut ledger = CopyLedger::load_from(&path);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(ledger
+        .record_filled_copy("tok_a".into(), "0xabc".into(), dec!(8), dec!(0.4))
+        .is_err());
+    assert!(ledger
+        .record_source_sale("tok_a", "0xabc", dec!(2), dec!(0.5), dec!(0))
+        .is_err());
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+    std::fs::remove_dir(&path).unwrap();
+}
+
+#[test]
 fn persistence_closed_at_timestamp_survives_reload() {
     let path = tmp_path("timestamp");
     let _ = std::fs::remove_file(&path);
@@ -247,12 +302,45 @@ fn load_from_missing_file_returns_empty_ledger() {
 }
 
 #[test]
-fn load_from_corrupt_json_returns_empty_ledger() {
+fn load_from_corrupt_json_refuses_to_replace_ledger() {
     let path = tmp_path("corrupt");
     std::fs::write(&path, b"not valid json {{{").unwrap();
-    let l = CopyLedger::load_from(&path);
-    assert!(l.entries.is_empty());
+    assert!(CopyLedger::load_from_checked(&path).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"not valid json {{{");
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn missing_paper_ledger_with_positions_refuses_startup() {
+    let path = tmp_path("missing_with_positions");
+    let _ = std::fs::remove_file(&path);
+    assert!(CopyLedger::load_for_paper(&path, true).is_err());
+    assert!(!std::path::Path::new(&path).exists());
+}
+
+#[test]
+fn paper_ledger_requires_exact_source_share_coverage() {
+    use polycopier::models::Position;
+    use std::collections::HashMap;
+
+    let mut ledger = CopyLedger::new_in_memory();
+    ledger
+        .record_filled_copy("tok_a".into(), "0xabc".into(), dec!(8), dec!(0.4))
+        .unwrap();
+    let mut positions = HashMap::new();
+    positions.insert(
+        "tok_a".into(),
+        Position {
+            token_id: "tok_a".into(),
+            size: dec!(8),
+            average_entry_price: dec!(0.4),
+        },
+    );
+    assert!(ledger.validate_paper_positions(&positions).is_ok());
+    positions.get_mut("tok_a").unwrap().size = dec!(7);
+    assert!(ledger.validate_paper_positions(&positions).is_err());
+    positions.clear();
+    assert!(ledger.validate_paper_positions(&positions).is_err());
 }
 
 #[test]
@@ -274,7 +362,7 @@ fn in_memory_ledger_save_does_not_write_any_file() {
 fn atomic_save_leaves_no_tmp_file_on_success() {
     let path = tmp_path("atomic");
     let _ = std::fs::remove_file(&path);
-    let tmp = format!("{}.tmp", &path);
+    let tmp = format!("{}.tmp", path);
     let _ = std::fs::remove_file(&tmp);
 
     {

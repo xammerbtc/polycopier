@@ -1,0 +1,23 @@
+[targets]
+wallets = ["0x2d2d2b32e5199edf833594a99b9c54e5668ab69d"]
+[execution]
+max_slippage_pct = 0.015
+max_trade_size_usd = 8.00
+max_delay_seconds = 6
+sell_fee_buffer = 0.97
+ignore_closing_in_mins = 20
+[sizing]
+mode = "self_pct"
+copy_size_pct = 0.04
+[scanner]
+max_copy_loss_pct = 0.25
+max_copy_gain_pct = 0.04
+min_entry_price = 0.03
+max_entry_price = 0.97
+max_entries_per_cycle = 1
+[risk]
+max_daily_volume_usd = 80
+max_consecutive_losses = 3
+loss_cooldown_secs = 900
+[ledger]
+retention_days = 60

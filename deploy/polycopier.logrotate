@@ -1,0 +1,10 @@
+/opt/polycopier/polycopier.log {
+    daily
+    maxsize 10M
+    rotate 3
+    compress
+    missingok
+    notifempty
+    copytruncate
+    su polycopier polycopier
+}

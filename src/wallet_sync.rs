@@ -19,7 +19,6 @@ use crate::copy_ledger::CopyLedger;
 use crate::models::{Position, TradeEvent, TradeSide};
 use crate::state::BotState;
 use alloy::primitives::Address;
-use polymarket_client_sdk::clob::types::request::OrdersRequest;
 use polymarket_client_sdk::data::Client as DataClient;
 use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet};
@@ -35,11 +34,9 @@ type State = Arc<RwLock<BotState>>;
 //    scanner's SkippedOwned check has accurate data from the first scan.
 //    Without this guarantee the scanner re-enters positions on every restart.
 // ---------------------------------------------------------------------------
-pub async fn seed_own_positions(funder: &str, state: State) {
+pub async fn seed_own_positions(funder: &str, state: State) -> anyhow::Result<()> {
     let client = DataClient::default();
-    let Ok(addr) = Address::from_str(funder) else {
-        return;
-    };
+    let addr = Address::from_str(funder)?;
     match crate::utils::fetch_all_positions(&client, addr).await {
         Ok(positions) => {
             let mut guard = state.write().await;
@@ -62,37 +59,48 @@ pub async fn seed_own_positions(funder: &str, state: State) {
                 guard.positions.len()
             );
         }
-        Err(e) => tracing::warn!("Could not seed own positions on startup: {}", e),
+        Err(e) => return Err(e),
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// 1b. Clear pending orders — startup routine ensures a clean slate
-//    by brutally cancelling all LIVE orders.
+// 1b. Restore copier-owned orders and preserve every foreign order.
 // ---------------------------------------------------------------------------
-pub async fn seed_pending_orders(clob: &AuthedClobClient, _state: State) {
-    let req = OrdersRequest::default();
-    match clob.orders(&req, None).await {
-        Ok(page) => {
-            let live = page
-                .data
-                .into_iter()
-                .filter(|o| format!("{:?}", o.status).to_uppercase().contains("LIVE"))
-                .collect::<Vec<_>>();
-            let count = live.len();
-            if count > 0 {
-                tracing::warn!("Startup: Found {} active limit orders. Enforcing strict cleanup policies (cancelling all).", count);
-                for o in live {
-                    if let Err(e) = clob.cancel_order(&o.id).await {
-                        tracing::error!("Failed to cancel startup order {}: {}", o.id, e);
-                    } else {
-                        tracing::info!("Cancelled startup order {}", o.id);
-                    }
-                }
-            }
+pub async fn seed_pending_orders(clob: &AuthedClobClient, state: State) -> anyhow::Result<()> {
+    let owned = crate::execution_journal::owned_ids()?;
+    let orders = crate::execution_journal::open_orders(clob).await?;
+    let mut guard = state.write().await;
+    for order in orders
+        .into_iter()
+        .filter(|o| format!("{:?}", o.status).to_uppercase().contains("LIVE"))
+    {
+        let token = order.asset_id.to_string();
+        if !owned.contains(&order.id) {
+            guard.foreign_order_tokens.insert(token);
+            continue;
         }
-        Err(e) => tracing::warn!("Could not fetch pending CLOB orders on startup: {}", e),
+        guard.pending_orders.insert(
+            token.clone(),
+            crate::models::QueuedOrder {
+                token_id: token,
+                price: order.price,
+                size: order.original_size - order.size_matched,
+                side: if format!("{:?}", order.side).to_uppercase().contains("BUY") {
+                    TradeSide::BUY
+                } else {
+                    TradeSide::SELL
+                },
+                event_end_date: None,
+            },
+        );
     }
+    tracing::info!(
+        "Restored {} copier orders; preserved {} foreign-order tokens",
+        guard.pending_orders.len(),
+        guard.foreign_order_tokens.len()
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -129,10 +137,7 @@ pub fn start_position_sync(
                         let mut guard = state.write().await;
                         guard.positions.clear();
                         for p in &positions {
-                            if p.redeemable
-                                || p.cur_price == Decimal::ZERO
-                                || p.size <= Decimal::ZERO
-                            {
+                            if p.size <= Decimal::ZERO {
                                 continue;
                             } else {
                                 guard.positions.insert(
@@ -149,7 +154,10 @@ pub fn start_position_sync(
 
                         // Gap 4: update ledger fill sizes for partial fills.
                         let mut ledger = copy_ledger.lock().await;
-                        for p in &positions {
+                        for p in positions
+                            .iter()
+                            .filter(|_| !crate::execution_journal::active())
+                        {
                             if p.redeemable || p.cur_price == Decimal::ZERO {
                                 continue;
                             }
@@ -235,7 +243,7 @@ pub fn start_price_refresh(target_wallets: Vec<String>, state: State) {
                 // to avg_entry (PnL = 0) when a token is absent from price_map.
                 // This is correct regardless of whether a target has already closed.
                 let unrealized: Decimal = g
-                    .positions
+                    .reported_positions()
                     .values()
                     .map(|p| {
                         let cur = price_map
@@ -315,8 +323,10 @@ pub fn start_position_close_sweep(
             };
 
             if !our_positions.is_empty() {
-                // Fetch all token IDs held by any target wallet (union).
-                let mut target_tokens: HashSet<String> = HashSet::new();
+                // Keep each wallet's footprint separate so one target's exit cannot
+                // liquidate another target's copied lot for the same token.
+                let mut target_tokens: HashMap<String, HashSet<String>> = HashMap::new();
+                let mut all_target_tokens: HashSet<String> = HashSet::new();
                 let mut fetch_failed = false;
                 let mut valid_targets_count = 0;
 
@@ -329,9 +339,15 @@ pub fn start_position_close_sweep(
                         valid_targets_count += 1;
                         match crate::utils::fetch_all_positions(&client, addr).await {
                             Ok(ps) => {
+                                let mut tokens = HashSet::new();
                                 for p in ps {
-                                    target_tokens.insert(p.asset.to_string());
+                                    if p.size > Decimal::ZERO {
+                                        let token = p.asset.to_string();
+                                        tokens.insert(token.clone());
+                                        all_target_tokens.insert(token);
+                                    }
                                 }
+                                target_tokens.insert(w.to_lowercase(), tokens);
                             }
                             Err(e) => {
                                 tracing::warn!("Position sweep: failed to fetch {}: {} - Aborting cycle to prevent unsafe liquidation", w, e);
@@ -349,53 +365,94 @@ pub fn start_position_close_sweep(
                     continue;
                 }
 
-                // For each position we hold, if no target still holds it → close.
+                // For each active source lot, close only when that same target has
+                // exited. The strategy will fill this synthetic market exit against
+                // current public bids in paper mode.
                 for pos in &our_positions {
-                    if target_tokens.contains(&pos.token_id) {
-                        continue; // Target still holds it — nothing to do.
+                    // Once Gamma marks a market closed, no CLOB exit is
+                    // possible. Leave its shares to the confirmed settlement
+                    // worker instead of retrying synthetic SELLs into 404.
+                    if state
+                        .read()
+                        .await
+                        .position_details
+                        .get(&pos.token_id)
+                        .is_some_and(|details| details.closed)
+                    {
+                        continue;
                     }
-
-                    let short_id = &pos.token_id[..pos.token_id.len().min(12)];
-                    tracing::warn!(
-                        "Position sweep: no target holds token {} (our size={:.2}) \
-                         — emitting synthetic SELL to close our position.",
-                        short_id,
-                        pos.size,
-                    );
-
-                    // Gap 2 fix: look up the ledger's source_wallet for this token
-                    // so the synthetic SELL's taker_address correctly matches the
-                    // ledger entry that record_close() will look for.
-                    let source_wallet = {
+                    if !config.is_sim {
+                        // Preserve the established single-token live sweep semantics;
+                        // source-specific attribution and book simulation below are
+                        // limited to the paper ledger.
+                        if all_target_tokens.contains(&pos.token_id) {
+                            continue;
+                        }
+                        let source_wallet = {
+                            let ledger = copy_ledger.lock().await;
+                            ledger
+                                .find_active_for_token(&pos.token_id)
+                                .map(|entry| entry.source_wallet.clone())
+                        };
+                        let Some(source_wallet) = source_wallet else {
+                            continue;
+                        };
+                        let timestamp = chrono::Utc::now().timestamp();
+                        let event = TradeEvent {
+                            transaction_hash: format!(
+                                "sweep_{}_{}",
+                                &pos.token_id[..pos.token_id.len().min(12)],
+                                timestamp
+                            ),
+                            maker_address: source_wallet.clone(),
+                            taker_address: source_wallet,
+                            token_id: pos.token_id.clone(),
+                            price: Decimal::new(1, 2),
+                            size: pos.size,
+                            side: TradeSide::SELL,
+                            timestamp,
+                        };
+                        if let Err(e) = tx.send(event).await {
+                            tracing::warn!("Position sweep: channel closed — stopping: {}", e);
+                            return;
+                        }
+                        continue;
+                    }
+                    let active_sources = {
                         let ledger = copy_ledger.lock().await;
-                        ledger
-                            .find_active_for_token(&pos.token_id)
-                            .map(|e| e.source_wallet.clone())
-                            .unwrap_or_else(|| {
-                                target_wallets
-                                    .first()
-                                    .cloned()
-                                    .unwrap_or_else(|| "sweep_fallback".to_string())
-                            })
+                        ledger.active_sources_for_token(&pos.token_id)
                     };
-
-                    let event = TradeEvent {
-                        transaction_hash: format!(
-                            "sweep_{}",
-                            &pos.token_id[..pos.token_id.len().min(12)]
-                        ),
-                        maker_address: source_wallet.clone(),
-                        taker_address: source_wallet.clone(),
-                        token_id: pos.token_id.clone(),
-                        price: rust_decimal::Decimal::new(1, 2), // $0.01 forces a pseudo market-order liquidation
-                        size: pos.size,
-                        side: TradeSide::SELL,
-                        timestamp: chrono::Utc::now().timestamp(),
-                    };
-
-                    if let Err(e) = tx.send(event).await {
-                        tracing::warn!("Position sweep: channel closed — stopping: {}", e);
-                        return;
+                    for (source_wallet, source_size) in active_sources {
+                        let Some(source_tokens) = target_tokens.get(&source_wallet.to_lowercase())
+                        else {
+                            // A removed/unconfigured source has no reliable current
+                            // footprint; never infer a sale from missing data.
+                            continue;
+                        };
+                        if source_tokens.contains(&pos.token_id) {
+                            continue;
+                        }
+                        let timestamp = chrono::Utc::now().timestamp();
+                        let event = TradeEvent {
+                            transaction_hash: format!(
+                                "sweep_{}_{}_{}",
+                                &pos.token_id[..pos.token_id.len().min(12)],
+                                &source_wallet[..source_wallet.len().min(10)],
+                                timestamp
+                            ),
+                            maker_address: source_wallet.clone(),
+                            taker_address: source_wallet.clone(),
+                            token_id: pos.token_id.clone(),
+                            price: Decimal::new(50, 2), // marker only; paper execution uses the live bid book
+                            size: source_size.min(pos.size),
+                            side: TradeSide::SELL,
+                            timestamp,
+                        };
+                        tracing::warn!("Position sweep: source {} no longer holds token {}; emitting source-specific exit for {:.4} shares", source_wallet, &pos.token_id[..pos.token_id.len().min(12)], event.size);
+                        if let Err(e) = tx.send(event).await {
+                            tracing::warn!("Position sweep: channel closed — stopping: {}", e);
+                            return;
+                        }
                     }
                 }
             } // Close if !our_positions.is_empty()

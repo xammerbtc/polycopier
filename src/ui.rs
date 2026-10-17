@@ -180,7 +180,14 @@ impl SettingsScreen {
                 "Max Event Age (secs)",
                 "execution.max_delay_seconds",
                 "10",
-                "Drop live events older than N seconds",
+                "SELL exit signal age; BUY may have a shorter optional limit",
+                false,
+            ),
+            SettingsField::new(
+                "Max BUY Age (secs)",
+                "execution.max_buy_delay_seconds",
+                "",
+                "Optional tighter BUY signal age; blank uses Max Event Age",
                 false,
             ),
             SettingsField::new(
@@ -430,6 +437,16 @@ impl SettingsScreen {
             cooldown = u64v("risk.loss_cooldown_secs", 300),
             retention = u32v("ledger.retention_days", 90),
         );
+        let buy_age = get("execution.max_buy_delay_seconds");
+        let content = if let Ok(seconds) = buy_age.parse::<i64>() {
+            content.replacen(
+                "[execution]\n",
+                &format!("[execution]\n             max_buy_delay_seconds = {seconds}\n"),
+                1,
+            )
+        } else {
+            content
+        };
         std::fs::write(path, content)?;
 
         // Refresh .env with secrets only (TARGET_WALLETS is now in config.toml)

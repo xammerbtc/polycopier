@@ -27,7 +27,69 @@ sim_copy_ledger.json
 .DS_Store
 
 # Rust
-Cargo.lock
+# Cargo.lock is tracked to make VPS builds reproducible.
+.cargo-registry/
+build.exit
+build.phase
+changes.tar
+simulation_state.json
+runtime-risk.json
+.env.credentials
+verification.json
+public-target-latest.json
+source-verified.tar
+deploy-backups/
+dummy.json
+npm-audit.json
+rust-audit.json
+rust-audit.exit
+rust-audit.err
+preview-update.tar
+redemption-journal.json
+execution-journal.json
+deploy/redeemer/package/
+deploy/redeemer/node_modules/
+ownership-update.tar
+ownership-final.tar
+deploy/redeemer/*.tgz
+runtime/
 .agents/
 
 src/bin/order_test.rs
+
+release-final-20261011.tar
+
+durable-journal-20261011.tar
+
+fills-core-20261011.tar
+
+fills-rpc-20261011.tar
+
+fills-proof-20261011.tar
+fills-wiring-20261011.tar
+settlement-fills.json
+settlement-fills.json.tmp
+fills-continuous-20261011.tar
+paper-experiment.json
+latency-paper-qualification.json
+
+# Generated Python bytecode is not source.
+__pycache__/
+*.py[cod]
+
+# Runtime storage supervision outputs.
+/.build.lock
+/storage-status.json
+/.storage-status-*
+/storage-logrotate.status
+
+# Generated graph, local agent state, and recoverable operator snapshots.
+/.codex/
+/graphify-out/
+/.paper-bank-*-applied
+/config.toml.before-*
+/simulation_state.json.before-*
+/src/*.rs.before-*
+/web/dist-before-*/
+/web/dist.rollback-*/
+/polycopier.log.*.gz

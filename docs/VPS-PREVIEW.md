@@ -1,0 +1,442 @@
+# Isolated VPS deployment
+
+This deployment runs **DRY-RUN / SIMULATION**. The opening balance and all
+positions/PnL displayed by this deployment are paper values. No CLOB
+authentication, signed orders, cancellations, or on-chain transactions occur.
+
+## Fresh proportional paper experiment
+
+The requested profile starts with **$1000**, zero positions, realized PnL and
+daily volume. The favourite wallet uses `:0.5` with `sizing.mode=target_scalar`.
+In this paper mode every BUY and SELL copies half the target's share count
+(truncated to two decimals), including repeated BUYs and partial SELLs. SELLs
+cannot exceed owned inventory; BUYs that cannot be funded including fees are
+skipped rather than silently changing the fraction. Tiny paper fills are
+included even below the live CLOB minimum, so this experiment does not establish
+live execution eligibility for those fills.
+
+Daily and consecutive-loss limits are disabled (both zero), the per-trade cap is
+set above the available bank, closing-time filtering and historical catch-up
+are disabled. The 1.5% price limit and six-second signal freshness remain active;
+unavailable fee schedules still cause a visible skip.
+
+After a successful build, an explicitly authorized reset is performed with:
+
+```bash
+flock -n /opt/arbigab/operator_control/locks/production.lock python3 deploy/start-paper-experiment.py
+```
+
+This backs up the old stopped paper state, unit, config and binary beneath
+`deploy-backups/*-experiment-reset`, updates only `polycopier-preview`, and sets
+`PAPER_EXPERIMENT_START_TIMESTAMP` to exclude trades predating the experiment.
+`paper-experiment.json` records the opening values, start time and backup path.
+Re-running this command resets the experiment again; ordinary restarts preserve it.
+
+A separate fresh real-source paper qualification observed matching dispatch and
+acceptance keys for a WebSocket target fill: dispatch upper bound **1291 ms**,
+paper acceptance upper bound **1443 ms**. This is a paper observation; no live
+order was sent.
+
+## Installed layout
+
+- Source/build/UI/state: `/opt/polycopier`
+- Service account: `polycopier` (no login shell)
+- Service: `polycopier-preview.service`
+- Dashboard: `127.0.0.1:3000`, configurable through `DASHBOARD_BIND`
+- Token: `/opt/polycopier/.env`, mode 0600
+- Donor wallet credentials: `/opt/polycopier/.env.credentials`, root-only 0600;
+  this file is **not loaded** by the preview service
+- Public tunables: `config.toml`
+- Paper state: `simulation_state.json` and `sim_copy_ledger.json`
+- Daily volume / circuit-breaker state: `runtime-risk.json`
+- Logs: journald and `polycopier.log`
+
+The existing arbigab deployment has separate services, files and ports. Its
+service lifecycle and risk settings are not changed by this installer.
+
+## Build and install on Ubuntu
+
+Prerequisites: Docker, Python 3, Node/npm, systemd, OpenSSL development/runtime
+libraries appropriate to the Ubuntu host. Build in the Bookworm Rust image;
+record its immutable digest and retain `Cargo.lock` for repeatable builds.
+
+```bash
+cd /opt/polycopier
+bash deploy/build-vps.sh
+# Only after tests, clippy, release build and frontend build succeed:
+flock -n /opt/arbigab/operator_control/locks/production.lock bash deploy/install-preview.sh
+sudo install -m 644 deploy/logrotate-preview /etc/logrotate.d/polycopier-preview
+python3 deploy/verify-preview.py
+```
+
+Use the VPS's existing SSH connection to access the dashboard:
+
+```bash
+ssh -N -L 13000:127.0.0.1:3000 arbigab-vps
+```
+
+Open `http://127.0.0.1:13000`. Username: `polycopier`. Password is the
+`DASHBOARD_TOKEN` stored on the VPS. Retrieve it through your own secure SSH
+session; do not paste it into issues, commits, reports, or chat logs. Token
+values are never returned by the dashboard API.
+
+For a reverse proxy, keep the backend bound to localhost, use HTTPS, preserve
+the Host header, and keep the API's Basic authentication enabled. Example:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+## Live settings
+
+Wallets can include an optional scalar: `0xADDRESS:0.01`. A scalar of `0`
+temporarily disables that wallet while keeping it in the configuration.
+Set `scanner.max_entries_per_cycle=0` to disable catch-up entries while
+continuing to display target portfolios. Target changes are consumed by polling
+every cycle and RTDS heartbeat every five seconds. Risk/sizing/execution settings
+are consumed before evaluating the next event. Config writes are atomic and
+invalid settings are rejected with HTTP 400.
+
+RTDS subscribes to the public `activity/trades` feed and filters target wallet
+addresses locally. Polling remains active to cover outages. The combined stream
+deduplicates by transaction, wallet, token, side, price and size, retaining
+different token fills from one transaction. Heartbeats run every five seconds;
+45 seconds without inbound messages triggers reconnect with bounded backoff.
+
+The <1.5-second latency goal requires measured target fills. A connected socket
+alone does not prove that latency, and target event timestamps have only
+second-level precision. Observe actual events before making any latency claim.
+
+## API endpoints
+
+All paths except `/health` require Basic authentication.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/health` | Process status, execution mode, websocket connection, poll timestamp, active listener targets |
+| GET | `/api/state` | Balance, paper/live mode, PnL, volume, positions, signal feed and source mapping |
+| GET | `/api/config` | Public tunables and configured targets; JSON export |
+| POST | `/api/config` | Validate and atomically save tunables, consumed without restarting |
+| GET | `/api/env` | Public funder address and blank private-key field for compatibility |
+| POST | `/api/control` | `{"action":"pause"}`, `stop`, `start`, or `resume` |
+| GET | `/api/ledger` | Copy history and ledger export |
+| GET | `/api/logs` | Last 200 file-log lines |
+| GET | `/api/metrics` | Target-stream counters and last order latency observations |
+| POST | `/api/redeem` | Settle paper positions, or explicitly enabled live redemption through the official SDK |
+| GET | `/api/redemption` | Live credential status and nonsecret redemption journal |
+| GET | `/api/executions` | Copier order IDs and durable submission intents |
+| POST | `/api/action/restart` | Replace only the polycopier process, preserving CLI simulation flags |
+
+The secret-writing `/api/env` POST is disabled. Credential changes belong in a
+secure server-side workflow. Force Redeem in preview verifies a closed binary
+market with exactly one winner through Gamma/CLOB, credits paper payout, persists
+state, and closes ledger records. Lookup failures and ambiguous resolutions leave
+positions unchanged. Repeated requests cannot pay out a removed position twice.
+This preview never submits an on-chain redemption. The live SDK bridge uses
+`@polymarket/client` 0.13.0 with viem 2.57.4 and an isolated, pinned Node 24
+runtime installed by `deploy/install-redeemer.sh`. It supports the wallet and
+protocol routes selected by the official SDK. It only calls redemption; it does
+not create approvals, transfer funds elsewhere, or place orders.
+
+Live Redeem requires live execution mode, `LIVE_REDEEM_ENABLED=true`, the signer
+and funder, and `POLYMARKET_RELAYER_API_KEY` plus
+`POLYMARKET_RELAYER_API_KEY_ADDRESS`. Keep these in a root-only environment file
+consumed by systemd; never paste values into chat or commits. The Relayer key is
+distinct from a CLOB API key. The donor credentials currently provide the
+signer/funder only. Do not enable live without resolving shared-wallet order
+ownership and signature-type compatibility.
+
+The endpoint selects resolved holdings present in this copier's active ledger,
+serializes requests, and persists intent before SDK submission. It waits for a
+confirmed transaction hash before closing ledger records. An uncertain result
+leaves `pending_reconciliation` in `redemption-journal.json` and blocks automatic
+retry. Reconcile using the wallet's on-chain/Relayer history before any manual
+change to that journal; deleting pending intent is not an idempotency mechanism.
+Live execution remains unverified until credentials and on-chain preflight are
+available. SDK mock tests prove call routing and confirmation/error handling,
+not a successful live redemption.
+
+Live CLOB startup preserves all wallet orders. Exact CLOB order IDs registered
+in `execution-journal.json` are the only orders the copier watcher may cancel.
+Tokens with another bot's open orders and holdings outside this copier's ledger
+are excluded from execution. Intent is persisted before submitting a signed
+order. Ambiguous network/persistence outcomes pause execution and block live
+startup or resume until reconciled; reserved margin is not blindly refunded.
+The donor is a Gnosis Safe: use `CLOB_SIGNATURE_TYPE=2` in its staging environment.
+`0/eoa`, `1/proxy`, and `2/safe` are explicit supported selections.
+
+After a successful build, root can run `target/release/live_preflight
+/opt/polycopier/.env.credentials` to check CLOB authentication, the balance
+endpoint, and reported IP trading availability. It does not submit, cancel, or
+redeem orders and never prints credentials. This check does not certify live
+order fills, approvals, gasless redemption, or a separate funded account.
+
+Metrics distinguish websocket and polling observations. Fill timestamps have
+one-second precision, so fill-to-dispatch is reported as an upper bound, while
+receive-to-dispatch uses a monotonic clock. These are dispatch observations,
+not confirmation of a live order accepted by the exchange. A null fill-latency
+field means the latest dispatch has no matching observed target fill.
+Acceptance metrics cover the submitter's completed acknowledgement, include
+SDK preparation time, and carry `execution_mode`; paper acknowledgements are
+not live exchange acceptances. HTTP clients are reused between metadata queries.
+Synthetic catch-up and position-sweep orders are counted as dispatches but have
+null fill-latency fields; their generated timestamps cannot prove RTDS latency.
+
+## Dependency audit
+
+The locked Rust dependency audit on 2026-10-11 found zero advisories classified
+as vulnerabilities, plus five unmaintained-crate warnings and three soundness
+warnings in `lru` 0.12.5/0.16.4 via ratatui/alloy-provider. The panic-safety
+warning requires panicking key destructors; these consumers use Rect/Layout,
+B256, and block-number keys. The ratatui cache does not use LRU IterMut. These
+observations limit applicability; they do not erase upstream warnings. Replacing
+those dependencies requires a separate compatibility upgrade. Frontend npm audit
+after compatible updates reports zero vulnerabilities.
+
+## Operations and rollback
+
+```bash
+systemctl status polycopier-preview
+journalctl -u polycopier-preview --since '30 minutes ago'
+curl -fsS http://127.0.0.1:3000/health
+systemctl stop polycopier-preview
+```
+
+Graceful shutdown pauses new execution, allows up to 25 seconds for in-flight
+simulation orders, then persists the paper state. Invalid or unreadable persisted
+state fails startup instead of silently resetting balances. Configuration reload
+preserves the execution mode and credentials.
+
+Before an update, preserve the existing binary and `web/dist`, together with
+the config and runtime state, in a private timestamped directory. Build and test
+the update before restarting this service. Rollback restores that binary/UI and
+restarts `polycopier-preview`; retain current ledgers and snapshots. Stop only
+the new service if verification fails. Do not restart the existing trading bot.
+
+Live trading has not been enabled or certified by this preview deployment.
+Live startup completes authoritative wallet and open-order reads before starting
+the strategy. Failed reads stop startup rather than imply an empty wallet.
+Resolved holdings remain visible for redemption. Live SELL size is bounded by
+confirmed copier fills; wallet refresh cannot enlarge that inventory using
+another bot's purchases.
+
+The `live_fills` decoder reads exact shares, collateral and fees from finalized
+CTF Exchange V2 `OrderFilled` events for journal-owned order IDs. Regression
+tests include a real public target-wallet receipt, duplicate events, partial
+fills, foreign orders, finality and canonical-header checks. The read-only
+`target/release/receipt_preflight` checks the public fixture against Polygon.
+Set `POLYGON_RPC_URL` for a different Polygon provider if needed. No credentials
+are loaded by that preflight. This does not prove a copier order was executed.
+Live startup and a five-second collector paginate authenticated CLOB trades,
+select confirmed transactions for exact journal-owned order IDs, and verify
+finalized Polygon receipts before recording `settlement-fills.json`. Atomic
+ledger recovery uses the source wallet persisted before submission. The live
+dashboard and unrealized PnL use this confirmed inventory, excluding other bots'
+holdings. Collection errors or a snapshot older than 60 seconds block execution
+and resume. Zero-filled entries close only after explicit CLOB CANCELED status.
+Cancellation alone never counts as a loss.
+
+Closed-position outcomes include actual collateral fees. The strategy replays
+them into `runtime-risk.json` every two seconds and before each live signal.
+Persisted outcome IDs prevent double-counting on restart; persistence failures
+block execution. Partial sells do not increment the consecutive-loss counter.
+Live SELL acceptance keeps the ledger open and does not book realized profit.
+Confirmed fill and fee reconciliation remains required before enabling live
+trading; wallet position refresh alone cannot establish execution prices or
+attribute concurrent trades by other bots using the same wallet.
+
+Use `target/release/relayer_preflight /opt/polycopier/.env.credentials` as root
+to check the supplied Relayer API key with the authenticated read-only
+`GET /transactions` endpoint. It prints no keys, wallet addresses or transaction
+contents, and submits no transactions. Credentials remain root-only (0600).
+Preview does not load them. Live Force Redeem pauses new execution and requires
+fresh owned inventory, finalized copier fills, a resolved binary market with
+trading closed, and no outstanding orders in either outcome. On-chain balances
+for both outcomes must exactly equal copier inventory; other bots' shares block
+redemption. SDK acknowledgement leaves the ledger open until a canonical,
+finalized receipt proves the exact owned ERC-1155 debit/burn and actual pUSD
+credit. The configured adapter's ERC-1155 permission must already be present;
+the copier does not grant approvals during redemption. SDK and receipt reads use
+`POLYGON_RPC_URL` or the public Polygon provider verified by preflight.
+Zero-payout losing positions still require a burn. Delegated adapter
+routes are traced; foreign pooling, unknown routes, amount mismatches and
+uncertain receipts fail closed. Persisted receipt proofs feed fee-inclusive
+realized PnL and deduplicated closed-position risk outcomes. The bot stays paused
+after redemption; resume requires completed reconciliation. The dashboard shows
+pending confirmation and disables retry while a receipt needs attention.
+
+`target/release/redemption_receipt_preflight` verifies an independently observed
+public target-wallet redemption receipt, without credentials or transactions.
+This proves the decoder and Polygon read path, not a redemption submitted by
+this copier. A real copier redemption and live fill-to-order latency remain
+unexecuted in this dry-run deployment. Protocol V3/PositionManager fills are not
+silently treated as CTF fills; unsupported settlement contracts block execution.
+
+Live risk reconciliation replays the complete finalized book in chain order
+when the book or risk limits change. A late older fill cannot be appended after
+an already observed win. Equal timestamps retain block/transaction/log order;
+duplicate, future, unordered or missing previously settled outcomes block
+execution. Expired historical cooldowns do not seed a new loss streak, and a
+failed risk write does not advance the in-memory checkpoint. The replay snapshot
+persists so an unchanged book is not charged again after restart.
+
+As root, `runtime/node24 deploy/redeemer/preflight.mjs .env.credentials` checks
+the actual official SecureClient authentication, configured deployed Safe and
+both CTF redemption adapter permissions, without sending approvals or redeeming.
+The deployed Safe passed this check on 2026-10-11; both permissions were present.
+
+Paper fills read the exact CTF market's `feesEnabled` and `feeSchedule` from
+Gamma (60-second cache), apply the documented taker curve with five-decimal
+rounding, and reject missing or unsupported fee schedules. They model instant
+taker fills at the limit price; they do not claim real GTC matching or maker
+rebates. BUY fees enter the held position's cost basis. Partial SELLs preserve
+the ledger and remaining shares, realize only the sold slice, and persist the
+cycle's accumulated PnL. The loss streak receives one combined outcome on full
+exit or redemption, including partial exits before a restart. Existing snapshots
+without accumulated cycle PnL remain readable; historical omitted fees cannot be
+reconstructed from an old paper snapshot. Live accounting uses confirmed actual
+fees; its balance reservation uses the current highest published coefficient
+(0.07) rather than the previous underestimated 0.02 estimate.
+
+Completed paper outcomes are saved atomically and fsynced with the balance and
+positions before risk notification. Risk consumes only committed outcomes;
+restart replays any saved close whose notification was lost, with persisted IDs
+preventing a second charge. Snapshot or risk persistence failure pauses execution.
+
+The configured SELL buffer is applied to copier-owned shares before truncating
+to two decimal places. At the requested 0.97 buffer, 20.003 owned shares produce
+a 19.40-share sale and a 0.603-share residual; the ledger remains active.
+BUY limit prices round down to the supported two-decimal tick and SELL prices
+round up. The rounded price must still satisfy the exact configured slippage
+bound; impossible price bounds skip the order instead of relaxing the limit.
+
+Dispatch latency is recorded immediately before the live CLOB POST, after SDK
+order preparation/signing and durable intent. Paper mode records dispatch immediately before its simulated acceptance. Preparation alone does not count as a dispatch;
+failed preparation clears its marker. Dispatch and acknowledgement expose their
+source event keys so a qualification cannot combine two concurrent signals.
+
+An isolated five-minute paper latency observation on 2026-10-11 connected to
+RTDS but received no new target-wallet trades before its runtime limit. It used
+closing=0 and catch-up disabled, had no trading credentials, and did not change
+the deployed closing=20 profile. It provides no qualifying fill-to-order sample.
+
+## Position display and paper sweep correction (2026-10-12)
+
+Owned positions appear above history and include their independently queried
+market title, outcome, end time, market status and price source. Gamma lookups
+match exact CTF token IDs and explicitly include closed markets. Active CLOB
+midpoints are preferred; Gamma outcome reference prices cover removed order
+books, without treating them as an executed redemption or cash payout.
+
+RTDS and polling prices are canonicalized to six decimals for the shared fill
+key, retaining transaction, wallet, token, side and share count. This suppresses
+false stale-signal rejections of already-copied fills. Polling batches are
+processed in timestamp order. Freshness follows the configured max_delay_seconds; the new paper profile uses
+a five-minute recovery window.
+
+Proportional paper mode no longer runs the target-position disappearance sweep
+and ignores any queued `sweep_` signals. That legacy sweep generated artificial
+SELLs at $0.01, which are not target fills. Earlier paper inventory and realized
+PnL may include these artificial exits. The correction preserves that historical
+state and does not silently rewrite performance or restart the experiment.
+
+
+## Fresh $10,000 / 100% experiment (2026-10-12)
+
+The operator requested a new paper run, with a $10,000 opening balance and a
+1.0 target-share scalar. The reset saves the previous book, ledger, risk state,
+unit, config, running binary and previous experiment report before clearing the
+paper account. Only signals timestamped at or after the new start are eligible.
+Daily-volume and consecutive-loss limits stay disabled; catch-up entries and
+synthetic disappearance SELLs stay disabled. Historical source holdings are not
+seeded into this empty account. A SELL without copier inventory is skipped.
+Order share quantities retain the existing two-decimal truncation, and buys
+still require enough paper cash including fees.
+
+RTDS remains primary. A reused HTTP client polls every second (skipping
+missed ticks), explicitly includes maker and taker trades and paginates 100-fill
+pages through the last five minutes. Each page has a five-second timeout;
+errors retain backoff. Offset exhaustion is logged and counted, not presented
+as complete coverage. Pages are sorted before dispatch; overlapping polls and
+RTDS share deduplication. The in-memory queues hold 4096 signals. This is bounded
+recovery, not an exactly-once or zero-latency guarantee across API outages or
+process crashes. Source timestamps have one-second precision.
+
+Monitoring-only target holdings refresh every 30 seconds independently of fills.
+Fee/price HTTP connections use a two-second connect timeout, five-second total
+timeout, TCP_NODELAY and keepalive. The artificial 150 ms paper delay is removed.
+The dashboard shows signal, duplicate, poll-error and pagination-limit counters.
+Its paper processing table uses pending_orders, while completed fills appear
+in Paper Positions and history. The validated-signal count is explicitly a
+pre-execution count, not a count of fills. Distinct same-token fills remain
+separate in the feed. The new profile accepts fallback signals up to 300 seconds
+old; paper prices still model instant fills at the strategy limit price, so this
+experiment does not measure real execution liquidity or achievable live latency.
+
+
+The live observation found a fixed Data API URL serving a snapshot over ten
+minutes older than RTDS. A cache-distinct query returned the latest fills.
+A subsequent check showed arbitrary cache-busters were insufficient. Fallback
+now reads /activity with type=TRADE, explicit start/end timestamps and descending
+time order, using 100-row pages. These recognized filters form a moving
+five-minute window; its endpoints stay fixed across pages. It includes maker
+and taker activity and avoids repeatedly downloading old history. Tests verify
+the serialized filters and page boundary behavior. The client keeps pooled HTTP
+connections and no-cache. Upstream indexing delay remains possible.
+
+
+Paper snapshots now save recent committed source fill keys alongside inventory
+and cash, preventing a restored five-minute fallback window from applying those
+fills again. Keys are retained for ten minutes, exceeding the replay window.
+The upgrade script pauses submissions, drains pending orders, requires the
+recent feed to account for every accepted fill in the old runtime, then backs
+up and seeds those keys into the stopped snapshot before starting the new binary.
+If the feed cannot prove coverage, it resumes the old runtime and aborts instead
+of risking a replay. The experiment start, book and configuration are preserved.
+
+
+## Bounded build storage and disk checks (2026-10-12)
+
+Repeated Rust test builds had left about 29 GiB of regenerated debug artifacts
+and incremental caches. These were removed while preserving the running release
+binary and all account state. Three unused project build images and obsolete
+ordinary rollback copies were also removed, releasing 36.1 GB in the observed
+run. The root disk went from approximately 63% to 45% used. Polycopier's total
+project footprint became less than 1 GB; its trade state and log are only kilobytes.
+
+The previous Arbigab/Polymarket retention timers were disabled and did not cover
+this Rust project. A dedicated polycopier-storage-maintenance.timer now runs
+about every ten minutes. Its root-owned helper is installed at
+/usr/local/lib/polycopier-storage/storage-maintenance.py, with a shared production
+lock and a build lock. It refuses cleanup during a build and only removes named
+compiler-cache directories. The executable hash is checked before and after.
+It keeps the latest three ordinary update backups and all experiment-reset
+milestones. It never prunes Docker volumes or other projects' files. Only the
+three exact project toolchain image IDs may be removed, and only when no
+container references them; Docker removal never uses force or global prune.
+
+Log rotation is installed at /etc/logrotate.d/polycopier: 10 MB maximum-size
+rotation checks, three compressed archives, copytruncate, every maintenance run.
+Accounting, journal, credentials and ledger files are excluded. The helper writes
+one latest report, /opt/polycopier/storage-status.json, rather than accumulating
+reports. Usage >=80% or free space <20 GiB causes an explicit failed check and a
+journal alert. systemctl status polycopier-storage-maintenance.service and
+systemctl list-timers polycopier-storage-maintenance.timer expose its result.
+
+Builds now disable dev/test debug symbols and incremental compilation, require
+15 GiB free before starting, and run bounded cleanup on exit. Cleanup does not
+restart the preview or reset the experiment. The installed maintenance helper
+and logrotate configuration are root-owned; future changes must be installed
+from the checked-in deploy sources. File/symlink boundary, hardlinked executable
+preservation and backup-milestone retention are covered by three Python tests.
+
+Public source activity reports executions, including maker fills. It does not
+expose a foreign wallet's resting orders or their placements/cancellations. The
+public market book is aggregated by price/size; authenticated user updates belong
+to the authenticated account. Live code builds GTC limit orders at the configured
+price bounds. Paper mode is an instant taker-fill model at that limit price and
+does not simulate resting GTC matching or maker rebates.

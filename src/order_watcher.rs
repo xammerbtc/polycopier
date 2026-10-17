@@ -4,7 +4,6 @@ use crate::config::Config;
 use crate::risk::RiskEngine;
 use crate::state::BotState;
 use alloy::primitives::Address;
-use polymarket_client_sdk::clob::types::request::OrdersRequest;
 use polymarket_client_sdk::data::types::request::PositionsRequest;
 use polymarket_client_sdk::data::Client as DataClient;
 use rust_decimal::Decimal;
@@ -66,22 +65,30 @@ async fn run_once(
     data_client: &DataClient,
     state: &Arc<RwLock<BotState>>,
     copy_ledger: &Arc<tokio::sync::Mutex<crate::copy_ledger::CopyLedger>>,
-    risk_engine: &Arc<Mutex<RiskEngine>>,
+    _risk_engine: &Arc<Mutex<RiskEngine>>,
 ) -> anyhow::Result<()> {
     let target_wallets = &config.target_wallets;
     let max_loss = config.max_copy_loss_pct;
     // 1. Fetch our open live orders
-    let req = OrdersRequest::default();
-    let orders_page = clob.orders(&req, None).await?;
+    if crate::execution_journal::blocked() {
+        return Ok(());
+    }
+    let orders = crate::execution_journal::open_orders(clob).await?;
+    let owned = crate::execution_journal::owned_ids()?;
+    let mut foreign_tokens = std::collections::HashSet::new();
 
     // Prepare a set of tokens we actually care about, filtering for Live orders
     let mut open_tokens = std::collections::HashSet::new();
     let mut live_orders = Vec::new();
     let mut mapped_active_orders = Vec::new();
 
-    for o in orders_page.data {
+    for o in orders {
         let status_str = format!("{:?}", o.status).to_uppercase();
         if status_str.contains("LIVE") {
+            if !owned.contains(&o.id) {
+                foreign_tokens.insert(o.asset_id.to_string());
+                continue;
+            }
             open_tokens.insert(o.asset_id.to_string());
             live_orders.push(o.clone());
 
@@ -104,6 +111,7 @@ async fn run_once(
     {
         let mut guard = state.write().await;
         guard.active_orders = mapped_active_orders;
+        guard.foreign_order_tokens = foreign_tokens;
     }
 
     // --- GHOST PURGE ---
@@ -114,7 +122,7 @@ async fn run_once(
         let mut guard = state.write().await;
         let mut ghosts = Vec::new();
         for tid in guard.pending_orders.keys() {
-            if !open_tokens.contains(tid) {
+            if !open_tokens.contains(tid) && !guard.in_flight_tokens.contains(tid) {
                 ghosts.push(tid.clone());
             }
         }
@@ -250,9 +258,10 @@ async fn run_once(
 
                 // Gap C: notify risk engine when a loss-triggered cancel fires.
                 // This increments the consecutive-loss counter and may trigger cooldown.
-                if is_loss_cancel {
-                    let mut risk = risk_engine.lock().await;
-                    risk.record_loss();
+                if is_loss_cancel && !crate::execution_journal::active() {
+                    if let Some(tx) = state.read().await.risk_outcome_tx.clone() {
+                        let _ = tx.send(Decimal::NEGATIVE_ONE);
+                    }
                 }
             }
         }

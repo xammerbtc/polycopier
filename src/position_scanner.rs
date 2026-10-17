@@ -77,7 +77,7 @@ pub fn classify_position(
 }
 
 pub fn start_position_scanner(
-    config: Config,
+    mut config: Config,
     state: Arc<RwLock<BotState>>,
     tx: mpsc::Sender<TradeEvent>,
 ) {
@@ -112,6 +112,7 @@ pub fn start_position_scanner(
         let mut consecutive_errors: u32 = 0;
 
         loop {
+            config.hot_reload();
             // Compute next sleep based on how enterable the target's open positions still are.
             let adaptive_interval = {
                 let guard = state.read().await;
@@ -133,7 +134,12 @@ pub fn start_position_scanner(
             };
 
             // Intercept: use shortest interval between adaptive needs and chronological alignment.
-            let interval_secs = adaptive_interval.min(secs_until_burst);
+            let interval_secs = if config.scan_max_entries_per_cycle == 0 {
+                // Monitoring-only holdings refresh is independent of fill ingestion.
+                30
+            } else {
+                adaptive_interval.min(secs_until_burst)
+            };
 
             // Apply backoff on top of normal interval if API is misbehaving.
             let sleep_secs = if consecutive_errors > 0 {
@@ -157,6 +163,7 @@ pub fn start_position_scanner(
                 g.next_scan_secs = sleep_secs;
             }
             tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+            config.hot_reload();
 
             match scan_positions(&config, &state, &tx, &mut already_queued).await {
                 Ok(()) => {
@@ -263,15 +270,18 @@ async fn scan_positions(
     }
 
     // Brief read lock to snapshot our current holdings
-    let (our_token_ids, current_balance) = {
+    let (our_token_ids, current_balance, rejection_reasons) = {
         let guard = state.read().await;
         let ids = guard.positions.keys().cloned().collect();
         let bal = guard.total_balance;
-        (ids, bal)
+        let reasons = guard.rejection_reasons.clone();
+        (ids, bal, reasons)
     };
     let our_token_ids: HashSet<String> = our_token_ids;
 
     let mut all_positions: Vec<TargetPosition> = Vec::new();
+    let mut failed_wallets: HashSet<String> = HashSet::new();
+    let mut fetched_wallets = 0usize;
     // Gap 3 fix: tuple includes percent_pnl so we can sort by it correctly.
     let mut to_enter: Vec<(String, TradeEvent, Decimal)> = Vec::new();
 
@@ -289,9 +299,11 @@ async fn scan_positions(
             Ok(p) => p,
             Err(e) => {
                 warn!("Failed to fetch positions for {}: {}", wallet_str, e);
-                return Err(e); // let the caller apply backoff
+                failed_wallets.insert(wallet_str.to_ascii_lowercase());
+                continue;
             }
         };
+        fetched_wallets += 1;
 
         debug!(
             "Scanner: {} has {} open position(s)",
@@ -352,10 +364,7 @@ async fn scan_positions(
                 pos.title.clone()
             };
 
-            let engine_reason = {
-                let guard = state.read().await;
-                guard.rejection_reasons.get(&token_id).cloned()
-            };
+            let engine_reason = rejection_reasons.get(&token_id).cloned();
 
             all_positions.push(TargetPosition {
                 title,
@@ -372,17 +381,36 @@ async fn scan_positions(
         }
     }
 
+    if fetched_wallets == 0 && !config.target_wallets.is_empty() {
+        anyhow::bail!(
+            "Position scan failed for every target wallet; keeping the previous dashboard snapshot"
+        );
+    }
+
+    // A temporary Data API failure for one leader must not block healthy leaders,
+    // nor erase the last known rows for the unavailable wallet.
+    if !failed_wallets.is_empty() {
+        let guard = state.read().await;
+        all_positions.extend(
+            guard
+                .target_positions
+                .iter()
+                .filter(|position| {
+                    failed_wallets.contains(&position.source_wallet.to_ascii_lowercase())
+                })
+                .cloned(),
+        );
+    }
+
     let mut sized_entries: Vec<(String, TradeEvent, Decimal)> = Vec::new();
     let mut dropped_entries = Vec::new();
     let mut cleared_entries = Vec::new();
 
     for (token_id, ev, percent_pnl) in to_enter {
-        let pos_avg = all_positions
-            .iter()
-            .find(|p| p.token_id == token_id)
-            .map(|p| p.avg_price)
-            .unwrap_or(ev.price);
-        let target_notional = pos_avg * ev.size;
+        // `ev.price` already carries this wallet's own average entry price.
+        // Searching all_positions here made large scans quadratic and could
+        // accidentally use another wallet's average for the same token.
+        let target_notional = ev.price * ev.size;
         let wallet_scalar = config
             .target_scalars
             .get(&ev.maker_address)

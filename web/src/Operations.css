@@ -1,0 +1,12 @@
+.operations-controls input {
+  background: var(--panel-bg); color: var(--text-primary); border: 1px solid var(--border-color);
+  padding: .6rem .8rem; border-radius: 8px; min-width: 170px;
+}
+.operations-controls a {
+  color: var(--accent); border: 1px solid var(--border-color); border-radius: 8px;
+  padding: .6rem .8rem; text-decoration: none;
+}
+.operations-controls button {
+  background: var(--panel-bg); color: var(--text-secondary); border: 1px solid var(--border-color);
+  border-radius: 8px; padding: .6rem .8rem;
+}

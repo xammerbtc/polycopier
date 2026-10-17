@@ -52,6 +52,8 @@ pub struct BotConfig {
 pub struct TargetsConfig {
     /// Polymarket proxy wallet addresses to copy-trade.
     pub wallets: Vec<String>,
+    /// Optional user-assigned quality ratings: `0xADDRESS:1..5`.
+    pub ratings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,7 +65,9 @@ pub struct ExecutionConfig {
     pub max_trade_size_usd: Decimal,
     /// Discard listener events older than this many seconds (staleness filter).
     pub max_delay_seconds: i64,
-    /// SELL size = held_size × sell_fee_buffer. Absorbs CLOB fee. Default 0.97.
+    /// Optional tighter age limit for BUY signals; SELL exits retain max_delay_seconds.
+    pub max_buy_delay_seconds: Option<i64>,
+    /// SELL size = owned_size × sell_fee_buffer. Retains the remainder. Default 0.97.
     pub sell_fee_buffer: Decimal,
     /// Skip entries and cancel pending orders for markets that close within this many minutes.
     pub ignore_closing_in_mins: Option<u64>,
@@ -72,7 +76,7 @@ pub struct ExecutionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SizingConfig {
-    /// Sizing algorithm: "self_pct" | "target_usd" | "fixed".
+    /// Sizing algorithm: "self_pct" | "target_usd" | "target_scalar" | "fixed" | "bank_scaled".
     pub mode: String,
     /// Fraction of our balance per trade for self_pct mode (e.g. 0.15 = 15%).
     pub copy_size_pct: Option<Decimal>,
@@ -106,6 +110,10 @@ pub struct RiskConfig {
     pub max_consecutive_losses: u32,
     /// Seconds to pause after hitting max_consecutive_losses. Default 300.
     pub loss_cooldown_secs: u64,
+    /// Paper account-equity gain required before trimming losing positions.
+    pub profit_guard_trigger_pct: Decimal,
+    /// Paper position mark loss required for the profit guard exit.
+    pub profit_guard_loss_pct: Decimal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +129,7 @@ impl Default for ExecutionConfig {
             max_slippage_pct: Decimal::from_str("0.02").unwrap(),
             max_trade_size_usd: Decimal::from_str("10.00").unwrap(),
             max_delay_seconds: 10,
+            max_buy_delay_seconds: None,
             sell_fee_buffer: Decimal::from_str("0.97").unwrap(),
             ignore_closing_in_mins: Some(15),
         }
@@ -156,6 +165,8 @@ impl Default for RiskConfig {
             max_daily_volume_usd: Decimal::ZERO,
             max_consecutive_losses: 0,
             loss_cooldown_secs: 300,
+            profit_guard_trigger_pct: Decimal::new(7, 2),
+            profit_guard_loss_pct: Decimal::new(10, 2),
         }
     }
 }
@@ -188,6 +199,7 @@ pub struct Config {
     pub max_slippage_pct: Decimal,
     pub max_trade_size_usd: Decimal,
     pub max_delay_seconds: i64,
+    pub max_buy_delay_seconds: Option<i64>,
     pub ignore_closing_in_mins: Option<u64>,
     pub max_copy_loss_pct: Decimal,
     pub max_copy_gain_pct: Decimal,
@@ -203,6 +215,8 @@ pub struct Config {
     pub max_daily_volume_usd: Decimal,
     pub max_consecutive_losses: u32,
     pub loss_cooldown_secs: u64,
+    pub profit_guard_trigger_pct: Decimal,
+    pub profit_guard_loss_pct: Decimal,
     pub is_sim: bool,
     pub sim_balance: Option<rust_decimal::Decimal>,
 }
@@ -258,6 +272,17 @@ pub fn write_toml(cfg: &BotConfig) -> anyhow::Result<()> {
             .collect();
         format!("[{}]", quoted.join(", "))
     };
+    let ratings_toml = if cfg.targets.ratings.is_empty() {
+        "[]".to_string()
+    } else {
+        let quoted: Vec<String> = cfg
+            .targets
+            .ratings
+            .iter()
+            .map(|rating| format!("\"{rating}\""))
+            .collect();
+        format!("[{}]", quoted.join(", "))
+    };
 
     let content = format!(
         r#"# polycopier config -- safe to version control (no secrets here)
@@ -266,6 +291,8 @@ pub fn write_toml(cfg: &BotConfig) -> anyhow::Result<()> {
 [targets]
 # Polymarket proxy wallet addresses to copy-trade
 wallets = {wallets}
+# Optional manual ratings, stored separately so copy sizing is unaffected.
+ratings = {ratings}
 
 [execution]
 # Slippage buffer applied to copied trade price for limit orders (2% = 0.02)
@@ -274,13 +301,14 @@ max_slippage_pct = {slippage}
 max_trade_size_usd = {max_trade}
 # Drop listener events older than N seconds (staleness filter)
 max_delay_seconds = {delay}
-# SELL size = held_size x sell_fee_buffer (absorbs CLOB fee, default 0.97)
+{buy_delay_line}
+# SELL size = owned_size x sell_fee_buffer (retains remainder, default 0.97)
 sell_fee_buffer = {fee_buf}
 # Skip markets closing in less than X minutes (e.g. 15)
 {ignore_closing}
 
 [sizing]
-# Sizing algorithm: "self_pct" | "target_usd" | "fixed"
+# Sizing algorithm: "self_pct" | "target_usd" | "target_scalar" | "fixed" | "bank_scaled"
 mode = "{mode}"
 # Fraction of our balance per trade for self_pct mode (0.15 = 15%)
 {copy_size_line}
@@ -306,15 +334,22 @@ max_daily_volume_usd = {daily_vol}
 max_consecutive_losses = {consec_loss}
 # Seconds to pause after hitting max_consecutive_losses
 loss_cooldown_secs = {cooldown}
+profit_guard_trigger_pct = {profit_guard_trigger}
+profit_guard_loss_pct = {profit_guard_loss}
 
 [ledger]
 # Days to keep closed ledger entries before pruning on startup. 0 = never prune.
 retention_days = {retention}
 "#,
         wallets = wallets_toml,
+        ratings = ratings_toml,
         slippage = cfg.execution.max_slippage_pct,
         max_trade = cfg.execution.max_trade_size_usd,
         delay = cfg.execution.max_delay_seconds,
+        buy_delay_line = match cfg.execution.max_buy_delay_seconds {
+            Some(seconds) => format!("max_buy_delay_seconds = {seconds}"),
+            None => "# max_buy_delay_seconds = 15  # optional tighter BUY signal age".to_string(),
+        },
         fee_buf = cfg.execution.sell_fee_buffer,
         ignore_closing = match cfg.execution.ignore_closing_in_mins {
             Some(m) => format!("ignore_closing_in_mins = {}", m),
@@ -323,7 +358,7 @@ retention_days = {retention}
         mode = cfg.sizing.mode,
         copy_size_line = match cfg.sizing.copy_size_pct {
             Some(p) => format!("copy_size_pct = {p}"),
-            None => "# copy_size_pct = 0.15  # only used for self_pct mode".to_string(),
+            None => "# copy_size_pct = 0.15  # self_pct allocation or bank_scaled source-notional coefficient".to_string(),
         },
         loss_pct = cfg.scanner.max_copy_loss_pct,
         gain_pct = cfg.scanner.max_copy_gain_pct,
@@ -342,9 +377,12 @@ retention_days = {retention}
         daily_vol = cfg.risk.max_daily_volume_usd,
         consec_loss = cfg.risk.max_consecutive_losses,
         cooldown = cfg.risk.loss_cooldown_secs,
+        profit_guard_trigger = cfg.risk.profit_guard_trigger_pct,
+        profit_guard_loss = cfg.risk.profit_guard_loss_pct,
         retention = cfg.ledger.retention_days,
     );
-    fs::write(CONFIG_TOML_PATH, content)?;
+    fs::write("config.toml.tmp", content)?;
+    fs::rename("config.toml.tmp", CONFIG_TOML_PATH)?;
     Ok(())
 }
 
@@ -457,11 +495,17 @@ fn migrate_from_env(defaults: BotConfig) -> BotConfig {
     };
 
     BotConfig {
-        targets: TargetsConfig { wallets },
+        targets: TargetsConfig {
+            wallets,
+            ratings: vec![],
+        },
         execution: ExecutionConfig {
             max_slippage_pct: dec("MAX_SLIPPAGE_PCT", defaults.execution.max_slippage_pct),
             max_trade_size_usd: dec("MAX_TRADE_SIZE_USD", defaults.execution.max_trade_size_usd),
             max_delay_seconds: i64v("MAX_DELAY_SECONDS", defaults.execution.max_delay_seconds),
+            max_buy_delay_seconds: env::var("MAX_BUY_DELAY_SECONDS")
+                .ok()
+                .and_then(|value| value.parse().ok()),
             sell_fee_buffer: dec("SELL_FEE_BUFFER", defaults.execution.sell_fee_buffer),
             ignore_closing_in_mins: env::var("IGNORE_CLOSING_IN_MINS")
                 .ok()
@@ -497,6 +541,14 @@ fn migrate_from_env(defaults: BotConfig) -> BotConfig {
                 defaults.risk.max_consecutive_losses,
             ),
             loss_cooldown_secs: u64v("LOSS_COOLDOWN_SECS", defaults.risk.loss_cooldown_secs),
+            profit_guard_trigger_pct: dec(
+                "PROFIT_GUARD_TRIGGER_PCT",
+                defaults.risk.profit_guard_trigger_pct,
+            ),
+            profit_guard_loss_pct: dec(
+                "PROFIT_GUARD_LOSS_PCT",
+                defaults.risk.profit_guard_loss_pct,
+            ),
         },
         ledger: LedgerConfig {
             retention_days: u32v("LEDGER_RETENTION_DAYS", defaults.ledger.retention_days),
@@ -507,6 +559,33 @@ fn migrate_from_env(defaults: BotConfig) -> BotConfig {
 // ---------------------------------------------------------------------------
 // Config::load_or_prompt — primary entry point
 // ---------------------------------------------------------------------------
+
+/// Parse a target entry in `address:scalar:name` form. The older `address` and
+/// `address:scalar` formats remain valid for existing configuration files.
+pub fn parse_target_wallet(entry: &str) -> Option<(String, Decimal, String)> {
+    let mut parts = entry.trim().splitn(3, ':');
+    let address = parts.next()?.trim().to_ascii_lowercase();
+    if address.is_empty() {
+        return None;
+    }
+    let scalar = parts
+        .next()
+        .and_then(|value| Decimal::from_str(value.trim()).ok())
+        .unwrap_or(Decimal::ONE);
+    let name = parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "{}…{}",
+                &address[..address.len().min(6)],
+                &address[address.len().saturating_sub(4)..]
+            )
+        });
+    Some((address, scalar, name))
+}
 
 impl Config {
     pub async fn load_or_prompt(is_ui: bool) -> anyhow::Result<Self> {
@@ -620,7 +699,10 @@ impl Config {
                 .filter(|s| !s.is_empty() && !is_placeholder(s))
                 .collect();
             BotConfig {
-                targets: TargetsConfig { wallets },
+                targets: TargetsConfig {
+                    wallets,
+                    ratings: vec![],
+                },
                 ..toml_cfg
             }
         } else {
@@ -674,24 +756,16 @@ impl Config {
     }
 
     /// Build a flat [`Config`] from secrets + a [`BotConfig`].
-    fn from_parts(private_key: String, funder_address: String, cfg: BotConfig) -> Self {
+    pub fn from_parts(private_key: String, funder_address: String, cfg: BotConfig) -> Self {
         let mut target_wallets = Vec::new();
         let mut target_scalars = std::collections::HashMap::new();
 
         for entry in cfg.targets.wallets.iter() {
-            let s = entry.trim().to_lowercase();
-            if s.is_empty() {
-                continue;
-            }
-            if let Some((addr, scalar_str)) = s.split_once(':') {
-                let clean_addr = addr.trim().to_string();
-                target_wallets.push(clean_addr.clone());
-                let scalar = rust_decimal::Decimal::from_str(scalar_str.trim())
-                    .unwrap_or(rust_decimal::Decimal::ONE);
-                target_scalars.insert(clean_addr, scalar);
-            } else {
-                target_wallets.push(s.clone());
-                target_scalars.insert(s, rust_decimal::Decimal::ONE);
+            if let Some((address, scalar, _name)) = parse_target_wallet(entry) {
+                if scalar > Decimal::ZERO {
+                    target_wallets.push(address.clone());
+                    target_scalars.insert(address.clone(), scalar);
+                }
             }
         }
 
@@ -706,6 +780,7 @@ impl Config {
             max_slippage_pct: cfg.execution.max_slippage_pct,
             max_trade_size_usd: cfg.execution.max_trade_size_usd,
             max_delay_seconds: cfg.execution.max_delay_seconds,
+            max_buy_delay_seconds: cfg.execution.max_buy_delay_seconds,
             ignore_closing_in_mins: cfg.execution.ignore_closing_in_mins,
             max_copy_loss_pct: cfg.scanner.max_copy_loss_pct,
             max_copy_gain_pct: cfg.scanner.max_copy_gain_pct,
@@ -724,6 +799,8 @@ impl Config {
             max_daily_volume_usd: cfg.risk.max_daily_volume_usd,
             max_consecutive_losses: cfg.risk.max_consecutive_losses,
             loss_cooldown_secs: cfg.risk.loss_cooldown_secs,
+            profit_guard_trigger_pct: cfg.risk.profit_guard_trigger_pct,
+            profit_guard_loss_pct: cfg.risk.profit_guard_loss_pct,
             is_sim: false, // Injected dynamically in Config::load_or_prompt wrapper
             sim_balance: None,
         }
@@ -738,6 +815,115 @@ impl Config {
         let cfg = load_toml()?;
         Ok(Self::from_parts(private_key, funder_address, cfg))
     }
+
+    /// Reload only public tunables; credentials and execution mode stay fixed.
+    pub fn hot_reload(&mut self) {
+        if env::var("HOT_RELOAD_ENABLED").as_deref() != Ok("true") {
+            return;
+        }
+        if let Ok(cfg) = load_toml() {
+            if validate_config(&cfg).is_ok() {
+                let mut next =
+                    Self::from_parts(self.private_key.clone(), self.funder_address.clone(), cfg);
+                next.is_sim = self.is_sim;
+                next.sim_balance = self.sim_balance;
+                *self = next;
+            }
+        }
+    }
+}
+
+pub fn validate_config(cfg: &BotConfig) -> anyhow::Result<()> {
+    for target in &cfg.targets.wallets {
+        let mut parts = target.splitn(3, ':');
+        let address = parts.next().unwrap_or_default().trim();
+        let hex = address.strip_prefix("0x").unwrap_or("");
+        anyhow::ensure!(
+            hex.len() == 40 && hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "Invalid target address"
+        );
+        if let Some(s) = parts.next() {
+            let scalar = Decimal::from_str(s.trim())?;
+            anyhow::ensure!(
+                scalar >= Decimal::ZERO && scalar <= Decimal::ONE,
+                "Copy ratio must be between 0 and 1 (0 disables wallet)"
+            );
+        }
+        if let Some(name) = parts.next() {
+            anyhow::ensure!(name.trim().chars().count() <= 64, "Wallet name is too long");
+        }
+    }
+    for rating in &cfg.targets.ratings {
+        let Some((address, value)) = rating.rsplit_once(':') else {
+            anyhow::bail!("Invalid target rating")
+        };
+        let hex = address.strip_prefix("0x").unwrap_or("");
+        anyhow::ensure!(
+            hex.len() == 40 && hex.chars().all(|c| c.is_ascii_hexdigit()),
+            "Invalid target rating address"
+        );
+        let value: u8 = value.parse()?;
+        anyhow::ensure!((1..=5).contains(&value), "Target rating must be 1–5 stars");
+    }
+    let unit = |x: Decimal| x >= Decimal::ZERO && x <= Decimal::ONE;
+    anyhow::ensure!(
+        unit(cfg.execution.max_slippage_pct) && unit(cfg.execution.sell_fee_buffer),
+        "Execution fractions must be between 0 and 1"
+    );
+    anyhow::ensure!(
+        cfg.execution.max_trade_size_usd > Decimal::ZERO && cfg.execution.max_delay_seconds > 0,
+        "Trade size and delay must be positive"
+    );
+    anyhow::ensure!(
+        cfg.execution
+            .max_buy_delay_seconds
+            .is_none_or(|seconds| seconds > 0 && seconds <= cfg.execution.max_delay_seconds),
+        "BUY signal age must be positive and no greater than SELL signal age"
+    );
+    anyhow::ensure!(
+        cfg.risk.max_daily_volume_usd >= Decimal::ZERO,
+        "Daily volume must be nonnegative"
+    );
+    anyhow::ensure!(
+        unit(cfg.risk.profit_guard_trigger_pct) && unit(cfg.risk.profit_guard_loss_pct),
+        "Profit guard fractions must be between 0 and 1"
+    );
+    anyhow::ensure!(
+        unit(cfg.scanner.max_copy_loss_pct) && unit(cfg.scanner.max_copy_gain_pct),
+        "Scanner fractions must be between 0 and 1"
+    );
+    anyhow::ensure!(
+        unit(cfg.scanner.min_entry_price)
+            && unit(cfg.scanner.max_entry_price)
+            && cfg.scanner.min_entry_price < cfg.scanner.max_entry_price,
+        "Invalid entry price range"
+    );
+    anyhow::ensure!(
+        cfg.sizing.copy_size_pct.is_none_or(unit),
+        "Copy fraction must be between 0 and 1"
+    );
+    anyhow::ensure!(
+        [
+            "self_pct",
+            "target_usd",
+            "target_scalar",
+            "fixed",
+            "bank_scaled"
+        ]
+        .contains(&cfg.sizing.mode.as_str()),
+        "Unknown sizing mode"
+    );
+    if cfg.sizing.mode == "bank_scaled" {
+        anyhow::ensure!(
+            cfg.sizing.copy_size_pct.is_some(),
+            "Bank-scaled mode requires a source-notional copy coefficient"
+        );
+        anyhow::ensure!(
+            cfg.execution.max_trade_size_usd >= Decimal::from(10),
+            "Bank-scaled mode requires a trade cap of at least $10 to mirror small bets"
+        );
+    }
+    Ok(())
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -846,6 +1032,30 @@ retention_days = 30
         assert_eq!(
             config.scanner.max_entries_per_cycle,
             default_scanner.max_entries_per_cycle
+        );
+    }
+
+    #[test]
+    fn named_target_wallet_preserves_scalar_name_and_legacy_formats() {
+        assert_eq!(
+            parse_target_wallet("0xABCDEF:0.001:Ferrari Champions 2026"),
+            Some((
+                "0xabcdef".to_string(),
+                dec!(0.001),
+                "Ferrari Champions 2026".to_string()
+            ))
+        );
+        assert_eq!(
+            parse_target_wallet("0xABCDEF:0.5"),
+            Some(("0xabcdef".to_string(), dec!(0.5), "0xabcd…cdef".to_string()))
+        );
+        assert_eq!(
+            parse_target_wallet("0xABCDEF"),
+            Some((
+                "0xabcdef".to_string(),
+                Decimal::ONE,
+                "0xabcd…cdef".to_string()
+            ))
         );
     }
 

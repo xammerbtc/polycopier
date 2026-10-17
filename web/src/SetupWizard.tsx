@@ -39,8 +39,8 @@ export default function SetupWizard() {
         window.location.reload();
       }, 2000);
 
-    } catch (err: any) {
-      setError(err.message || 'An error occurred during setup');
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'An error occurred during setup');
       setLoading(false);
     }
   };
