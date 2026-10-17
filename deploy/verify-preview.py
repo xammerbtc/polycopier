@@ -39,6 +39,24 @@ accounting_residual = (
 assert abs(accounting_residual) <= Decimal('0.01'), (
     f'Paper accounting residual exceeds one cent: {accounting_residual}'
 )
+positions = state['positions']
+allocations = state['position_source_allocations']
+assert positions.keys() == allocations.keys(), 'Open paper positions lack source attribution'
+attributed_cost = Decimal(0)
+for token, position in positions.items():
+    sources = allocations[token]
+    assert sources, f'Paper token {token} has no source allocation'
+    shares = sum((Decimal(source['shares']) for source in sources), Decimal(0))
+    assert shares == Decimal(position['size']), (
+        f'Paper shares and source allocations differ for token {token}'
+    )
+    assert all(Decimal(source['shares']) > 0 for source in sources), (
+        f'Paper token {token} has a nonpositive source allocation'
+    )
+    attributed_cost += sum((Decimal(source['cost_basis']) for source in sources), Decimal(0))
+assert abs(attributed_cost - Decimal(state['open_cost_basis'])) <= Decimal('0.01'), (
+    'Paper open cost differs from source-attributed cost'
+)
 assert json.loads(request('/api/env')[1])['private_key'] == ''
 assert request('/api/env', {}, method='POST')[0] == 405
 cfg = json.loads(request('/api/config')[1])
@@ -72,6 +90,6 @@ assert any(b'Signals skipped (all reasons)' in contents for name, contents in se
 assert any(b'Maximum signal age for BUY' in contents for name, contents in served_assets.items()
            if name.endswith('.js')), 'Dashboard BUY signal age control is missing'
 health = json.loads(request('/health', authenticated=False)[1])
-report = {'authentication':'PASS','secret_redaction':'PASS','simulation_mode':'PASS','paper_accounting':'PASS','accounting_residual_usd':str(accounting_residual),'running_without_pause':'PASS','config_read':'PASS','buy_sell_age_settings':'PASS','dashboard_asset':'PASS','dashboard_asset_files':assets,'health':health}
+report = {'authentication':'PASS','secret_redaction':'PASS','simulation_mode':'PASS','paper_accounting':'PASS','accounting_residual_usd':str(accounting_residual),'source_allocation_accounting':'PASS','source_attributed_positions':len(positions),'running_without_pause':'PASS','config_read':'PASS','buy_sell_age_settings':'PASS','dashboard_asset':'PASS','dashboard_asset_files':assets,'health':health}
 pathlib.Path('/opt/polycopier/verification.json').write_text(json.dumps(report, indent=2))
 print(json.dumps(report, indent=2))
